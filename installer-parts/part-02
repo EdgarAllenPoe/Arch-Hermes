@@ -1,0 +1,151 @@
+        fi
+
+        say
+        say "Connecting to: $ssid"
+        say "If the network requires a password, iwd will ask for it securely now."
+        if ! iwctl station "$iface" connect "$ssid"; then
+            warn "Connection attempt failed."
+        fi
+
+        info "Waiting for IP connectivity and DNS..."
+        local n
+        for n in {1..30}; do
+            if internet_ok; then
+                ok "Wi-Fi, routing, DNS, and HTTPS are working."
+                return 0
+            fi
+            sleep 1
+        done
+
+        warn "The network connected, but the internet test did not succeed."
+        say "1) Retry the same process"
+        say "2) Open iwctl manually"
+        say "3) Exit installer"
+        local action
+        read -r -p "Choose: " action
+        case "$action" in
+            2) iwctl || true ;;
+            3) exit 1 ;;
+            *) : ;;
+        esac
+    done
+}
+
+partition_path() {
+    local disk="$1" number="$2"
+    if [[ "$disk" =~ [0-9]$ ]]; then
+        printf '%sp%s' "$disk" "$number"
+    else
+        printf '%s%s' "$disk" "$number"
+    fi
+}
+
+list_candidate_disks() {
+    local disk type ro rm
+    while read -r disk; do
+        [[ -n "$disk" ]] || continue
+        type="$(lsblk -dn -o TYPE "$disk" 2>/dev/null || true)"
+        ro="$(lsblk -dn -o RO "$disk" 2>/dev/null || true)"
+        rm="$(lsblk -dn -o RM "$disk" 2>/dev/null || true)"
+        [[ "$type" == "disk" && "$ro" == "0" ]] || continue
+        [[ -n "$LIVE_BOOT_DISK" && "$disk" == "$LIVE_BOOT_DISK" ]] && continue
+        # Normal mode shows internal/non-removable disks only. Set
+        # HERMES_ALLOW_REMOVABLE=1 when deliberately testing against USB media.
+        if [[ "${HERMES_ALLOW_REMOVABLE:-0}" != "1" && "$rm" == "1" ]]; then
+            continue
+        fi
+        printf '%s\n' "$disk"
+    done < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk" {print $1}')
+}
+
+select_target_disk() {
+    CURRENT_STAGE="disk-selection"
+    local -a disks=()
+    mapfile -t disks < <(list_candidate_disks)
+
+    if (( ${#disks[@]} == 0 )); then
+        die "No eligible internal installation disk was found. The installer USB is never offered as a target."
+    fi
+
+    say
+    say "Eligible installation disks:"
+    local i disk size model tran
+    for i in "${!disks[@]}"; do
+        disk="${disks[$i]}"
+        size="$(lsblk -dn -o SIZE "$disk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        model="$(lsblk -dn -o MODEL "$disk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        tran="$(lsblk -dn -o TRAN "$disk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$model" ]] || model="unknown model"
+        [[ -n "$tran" ]] || tran="unknown bus"
+        printf '  %2d) %-16s  %-9s  %-10s  %s\n' "$((i + 1))" "$disk" "$size" "$tran" "$model"
+    done
+    say
+
+    while :; do
+        local choice
+        read -r -p "Select installation disk number: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#disks[@]} )); then
+            TARGET_DISK="${disks[$((choice - 1))]}"
+            break
+        fi
+        warn "Enter one of the displayed numbers."
+    done
+
+    local bytes
+    bytes="$(lsblk -bdn -o SIZE "$TARGET_DISK" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes < MIN_DISK_BYTES )); then
+        die "The selected disk is smaller than 16 GiB. This installer refuses to use it."
+    fi
+
+    [[ -z "$LIVE_BOOT_DISK" || "$TARGET_DISK" != "$LIVE_BOOT_DISK" ]] \
+        || die "Refusing to erase the disk containing the live installer."
+
+    EFI_PART="$(partition_path "$TARGET_DISK" 1)"
+    ROOT_PART="$(partition_path "$TARGET_DISK" 2)"
+}
+
+confirm_erase() {
+    say
+    printf '%s%sFINAL DISK CHECK%s\n' "$C_RED" "$C_BOLD" "$C_RESET"
+    say "The following disk will be COMPLETELY ERASED:"
+    say
+    lsblk -o NAME,SIZE,MODEL,TYPE,FSTYPE,MOUNTPOINTS "$TARGET_DISK"
+    say
+    say "Target: $TARGET_DISK"
+    say "EFI:    $EFI_PART"
+    say "Root:   $ROOT_PART"
+    say
+    local confirmation
+    read -r -p "Type ERASE exactly to continue: " confirmation
+    [[ "$confirmation" == "ERASE" ]] || die "Erase confirmation not received. No disk changes were made."
+}
+
+capture_root_password() {
+    [[ -n "$ROOT_PASSWORD" ]] && return 0
+    say
+    say "Set the password you will use to log in as root at the laptop console."
+    local p1 p2
+    while :; do
+        read -r -s -p "New root password: " p1; say
+        [[ -n "$p1" ]] || { warn "Password cannot be blank."; continue; }
+        read -r -s -p "Retype root password: " p2; say
+        [[ "$p1" == "$p2" ]] || { warn "Passwords did not match. Try again."; continue; }
+        ROOT_PASSWORD="$p1"
+        unset p1 p2
+        ok "Root password captured for this installation session."
+        break
+    done
+}
+
+unmount_target_tree() {
+    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+        umount -R "$MOUNTPOINT" 2>/dev/null || true
+    fi
+}
+
+partition_disk() {
+    CURRENT_STAGE="partition-disk"
+    info "Preparing $TARGET_DISK..."
+
+    unmount_target_tree
+
