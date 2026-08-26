@@ -1,0 +1,150 @@
+
+# Reassert provider/model after OAuth in case a fallback wizard modified them.
+hermes config set model.provider "$PROVIDER" >/dev/null
+hermes config set model.default "$MODEL" >/dev/null
+
+# Harmless real request: proves OAuth + model routing works before the handoff.
+echo
+printf 'Testing a real Codex model request...\n'
+set +e
+VERIFY_OUTPUT="$(hermes --provider "$PROVIDER" --model "$MODEL" --oneshot 'Reply with exactly HERMES_OK' 2>&1)"
+VERIFY_RC=$?
+set -e
+if [[ $VERIFY_RC -ne 0 || "$VERIFY_OUTPUT" != *HERMES_OK* ]]; then
+    echo
+    echo "The initial model test failed. This can happen if the account does not"
+    echo "currently expose $MODEL even though OAuth succeeded."
+    echo
+    echo "$VERIFY_OUTPUT"
+    echo
+    echo "Opening Hermes' model picker. Select 'ChatGPT or Codex Subscription'"
+    echo "and choose an available Codex model. Do NOT choose OpenAI API."
+    hermes model
+    echo
+    echo "Rerunning a provider-agnostic verification..."
+    hermes --oneshot 'Reply with exactly HERMES_OK'
+fi
+printf '[OK] Hermes can make an authenticated model request.\n'
+
+cat <<'EOF'
+
+============================================================
+                     READY FOR HANDOFF
+============================================================
+
+A prepared first assignment is stored at:
+  /root/HERMES_FIRST_TASK.md
+
+The next step gives Hermes unrestricted root terminal authority for that
+prepared audit. This is intentional for this dedicated machine.
+
+Type START to submit the prepared task automatically.
+Type LATER to leave it pending for the next root login.
+EOF
+
+while :; do
+    read -r -p "Choice [START/LATER]: " answer
+    case "$answer" in
+        START)
+            echo
+            echo "Starting the first Hermes audit..."
+            # --yolo is deliberately gated behind the explicit START word.
+            # The first-task text prohibits repartition/reformat unless the
+            # operator explicitly requests that in a later conversation.
+            if hermes --yolo chat --query-file "$FIRST_TASK"; then
+                rm -f "$MARKER"
+                echo
+                echo "Hermes first-time handoff completed."
+                echo "Run 'hermes' to continue working interactively."
+                exit 0
+            else
+                echo
+                echo "The first task did not finish successfully. The pending marker"
+                echo "has been kept; this helper will run again at the next root login."
+                exit 1
+            fi
+            ;;
+        LATER)
+            echo "First task remains pending. It will be offered again at the next root login."
+            exit 0
+            ;;
+        *) echo "Type START or LATER." ;;
+    esac
+done
+FIRSTBOOT
+    chmod 700 "$MOUNTPOINT/usr/local/sbin/hermes-firstboot"
+
+    touch "$MOUNTPOINT/root/.hermes-firstboot-pending"
+    chmod 600 "$MOUNTPOINT/root/.hermes-firstboot-pending"
+
+    cat > "$MOUNTPOINT/root/.bash_profile" <<'EOF'
+# Auto-run the one-time Hermes setup after the first root console login.
+if [[ -f /root/.hermes-firstboot-pending && -x /usr/local/sbin/hermes-firstboot ]]; then
+    /usr/local/sbin/hermes-firstboot
+fi
+EOF
+    chmod 600 "$MOUNTPOINT/root/.bash_profile"
+}
+
+install_firstboot() {
+    write_first_task
+    write_firstboot_helper
+
+    # Final installed-system resolver configuration. systemd-resolved will
+    # create the target at boot; this is the normal stub-resolver symlink.
+    rm -f "$MOUNTPOINT/etc/resolv.conf"
+    ln -s ../run/systemd/resolve/stub-resolv.conf "$MOUNTPOINT/etc/resolv.conf"
+
+    ok "First-boot OAuth and Hermes handoff helper installed."
+}
+
+verify_installation() {
+    local failed=0
+
+    [[ -f "$MOUNTPOINT/etc/fstab" ]] || { fail "Missing /etc/fstab"; failed=1; }
+    [[ -f "$MOUNTPOINT/boot/loader/entries/arch.conf" ]] || { fail "Missing systemd-boot Arch entry"; failed=1; }
+    [[ -f "$MOUNTPOINT/boot/vmlinuz-linux" ]] || { fail "Missing kernel"; failed=1; }
+    [[ -f "$MOUNTPOINT/boot/initramfs-linux.img" ]] || { fail "Missing initramfs"; failed=1; }
+    [[ -x "$MOUNTPOINT/usr/local/bin/hermes" ]] || { fail "Missing Hermes command"; failed=1; }
+    [[ -x "$MOUNTPOINT/usr/local/sbin/hermes-firstboot" ]] || { fail "Missing first-boot helper"; failed=1; }
+    [[ -f "$MOUNTPOINT/root/.hermes/.no-bundled-skills" ]] || { fail "Hermes no-skills marker missing"; failed=1; }
+    [[ -f "$MOUNTPOINT/etc/iwd/main.conf" ]] || { fail "Missing iwd config"; failed=1; }
+    [[ -L "$MOUNTPOINT/etc/resolv.conf" ]] || { fail "/etc/resolv.conf is not the expected symlink"; failed=1; }
+
+    if grep -RqsE '(^|[[:space:]])OPENAI_API_KEY=[^[:space:]]+' "$MOUNTPOINT/root/.hermes" 2>/dev/null; then
+        fail "A non-empty OPENAI_API_KEY appears to be present under /root/.hermes."
+        failed=1
+    fi
+
+    arch-chroot "$MOUNTPOINT" systemctl is-enabled iwd.service >/dev/null 2>&1 \
+        || { fail "iwd.service is not enabled"; failed=1; }
+    arch-chroot "$MOUNTPOINT" systemctl is-enabled systemd-resolved.service >/dev/null 2>&1 \
+        || { fail "systemd-resolved.service is not enabled"; failed=1; }
+
+    (( failed == 0 )) || die "Final verification found one or more problems. Rerun hermes-install after correcting them."
+    ok "Final installation verification passed."
+}
+
+finish_install() {
+    mark_stage "complete"
+    CURRENT_STAGE="complete"
+
+    say
+    say "============================================================"
+    printf '%s%s             INSTALLATION COMPLETE%s\n' "$C_GREEN" "$C_BOLD" "$C_RESET"
+    say "============================================================"
+    say
+    say "Installed system:"
+    say "  Disk:       $TARGET_DISK"
+    say "  Hostname:   $HOSTNAME_VALUE"
+    say "  Boot:       systemd-boot / UEFI"
+    say "  Networking: iwd + systemd-resolved"
+    say "  Login:      root console login"
+    say "  Hermes:     /usr/local/bin/hermes"
+    say "  Provider:   ChatGPT/Codex OAuth will be authorized after reboot"
+    say
+
+    sync
+    unmount_target_tree
+
+    say "Remove the USB installer now."
