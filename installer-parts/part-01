@@ -1,0 +1,150 @@
+    fail "Command failed at line $line (exit $rc): $command"
+    append_log "ERROR stage=$CURRENT_STAGE exit=$rc line=$line command=$command"
+    say
+    say "Nothing else will be erased automatically."
+    say "After correcting the problem, run:  hermes-install"
+    say "The installer will offer Resume when it finds a valid partial install."
+    exit "$rc"
+}
+trap on_error ERR
+
+require_root() {
+    [[ $(id -u) -eq 0 ]] || die "Run this installer as root."
+}
+
+require_uefi() {
+    [[ -d /sys/firmware/efi/efivars ]] || die "This installer requires the live USB to be booted in UEFI mode."
+}
+
+require_commands() {
+    local missing=()
+    local cmd
+    for cmd in \
+        arch-chroot awk blkid bootctl curl findmnt genfstab grep ip iwctl lsblk \
+        mkfs.ext4 mkfs.fat mount mountpoint pacstrap parted sed systemctl \
+        udevadm umount wipefs; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} )); then
+        fail "The custom Arch ISO is missing required commands:"
+        printf '  %s\n' "${missing[@]}" >&2
+        die "Add the corresponding packages to the archiso profile and rebuild the ISO."
+    fi
+}
+
+detect_live_boot_disk() {
+    local src parent
+    LIVE_BOOT_DISK=""
+    if mountpoint -q /run/archiso/bootmnt 2>/dev/null; then
+        src="$(findmnt -rn -o SOURCE /run/archiso/bootmnt 2>/dev/null || true)"
+        if [[ -n "$src" ]]; then
+            src="$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")"
+            if [[ -b "$src" ]]; then
+                parent="$(lsblk -nr -o PKNAME "$src" 2>/dev/null | head -n1 || true)"
+                if [[ -n "$parent" ]]; then
+                    LIVE_BOOT_DISK="/dev/$parent"
+                elif [[ "$(lsblk -dn -o TYPE "$src" 2>/dev/null || true)" == "disk" ]]; then
+                    LIVE_BOOT_DISK="$src"
+                fi
+            fi
+        fi
+    fi
+    [[ -n "$LIVE_BOOT_DISK" ]] && info "Installer media detected on $LIVE_BOOT_DISK; it will be excluded from target choices."
+}
+
+detect_microcode() {
+    local vendor
+    vendor="$(grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}' || true)"
+    case "$vendor" in
+        GenuineIntel)
+            MICROCODE_PKG="intel-ucode"
+            MICROCODE_INITRD="/intel-ucode.img"
+            ;;
+        AuthenticAMD)
+            MICROCODE_PKG="amd-ucode"
+            MICROCODE_INITRD="/amd-ucode.img"
+            ;;
+        *)
+            MICROCODE_PKG=""
+            MICROCODE_INITRD=""
+            ;;
+    esac
+}
+
+internet_ok() {
+    ip route get 1.1.1.1 >/dev/null 2>&1 || return 1
+    curl -fsS --connect-timeout 5 --max-time 12 "$INTERNET_TEST_URL" >/dev/null 2>&1
+}
+
+wireless_interface() {
+    local p
+    for p in /sys/class/net/*/wireless; do
+        [[ -e "$p" ]] || continue
+        basename "$(dirname "$p")"
+        return 0
+    done
+    return 1
+}
+
+scan_ssids_with_iw() {
+    local iface="$1"
+    command -v iw >/dev/null 2>&1 || return 1
+    iw dev "$iface" scan 2>/dev/null \
+        | sed -n 's/^[[:space:]]*SSID: //p' \
+        | sed '/^[[:space:]]*$/d' \
+        | awk '!seen[$0]++'
+}
+
+configure_wifi() {
+    CURRENT_STAGE="wifi"
+    systemctl start iwd.service >/dev/null 2>&1 || true
+
+    if internet_ok; then
+        ok "Internet connection is already working."
+        return 0
+    fi
+
+    local iface
+    iface="$(wireless_interface || true)"
+    [[ -n "$iface" ]] || die "No Wi-Fi interface was detected. This build is intended for Wi-Fi-only installation."
+
+    info "Wi-Fi interface: $iface"
+
+    while ! internet_ok; do
+        info "Scanning for nearby Wi-Fi networks..."
+        iwctl station "$iface" scan >/dev/null 2>&1 || true
+        sleep 2
+
+        local -a ssids=()
+        local attempt
+        if command -v iw >/dev/null 2>&1; then
+            for attempt in 1 2 3; do
+                mapfile -t ssids < <(scan_ssids_with_iw "$iface" || true)
+                (( ${#ssids[@]} > 0 )) && break
+                sleep 2
+            done
+        fi
+
+        local ssid=""
+        if (( ${#ssids[@]} > 0 )); then
+            say
+            say "Available Wi-Fi networks:"
+            local i
+            for i in "${!ssids[@]}"; do
+                printf '  %2d) %s\n' "$((i + 1))" "${ssids[$i]}"
+            done
+            say
+            while :; do
+                local choice
+                read -r -p "Select Wi-Fi network number: " choice
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ssids[@]} )); then
+                    ssid="${ssids[$((choice - 1))]}"
+                    break
+                fi
+                warn "Enter one of the displayed numbers."
+            done
+        else
+            warn "A numbered scan could not be produced. iwd's network list follows:"
+            iwctl station "$iface" get-networks || true
+            read -r -p "Enter the Wi-Fi SSID exactly: " ssid
+            [[ -n "$ssid" ]] || { warn "SSID cannot be blank."; continue; }

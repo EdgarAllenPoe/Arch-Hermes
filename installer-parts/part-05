@@ -1,0 +1,150 @@
+    [[ -x "$MOUNTPOINT/usr/local/bin/hermes" ]] || die "Hermes installer completed but /usr/local/bin/hermes is missing."
+    [[ -d "$MOUNTPOINT/root/.hermes" ]] || die "Hermes data directory /root/.hermes was not created."
+
+    # Explicitly prevent an inherited / accidental direct OpenAI API key from
+    # becoming part of this deployment. ChatGPT/Codex OAuth is configured at
+    # first boot instead.
+    if [[ -f "$MOUNTPOINT/root/.hermes/.env" ]]; then
+        sed -i '/^[[:space:]]*OPENAI_API_KEY=/d' "$MOUNTPOINT/root/.hermes/.env"
+        chmod 600 "$MOUNTPOINT/root/.hermes/.env"
+    fi
+
+    ok "Hermes Agent installed under the root/FHS layout."
+}
+
+write_first_task() {
+    cat > "$MOUNTPOINT$FIRST_TASK_PATH" <<'EOF'
+# First assignment for Hermes
+
+You are running as root on a deliberately minimal Arch Linux installation dedicated to Hermes Agent.
+
+Audit the boot configuration, partitions, filesystem, Wi-Fi networking, DNS, time synchronization, package state, available hardware, and Hermes installation.
+
+Confirm that the system can recover after a normal reboot and reconnect to the configured Wi-Fi automatically.
+
+Keep the machine console-only. Do not install a desktop environment, display manager, browser stack, local LLM runtime, local model files, CUDA, office software, or unrelated applications.
+
+Use the ChatGPT/Codex subscription provider. Never configure an OpenAI API key.
+
+Keep only software required for reliable Arch operation, networking, Hermes, Hermes updates, terminal/file tools, and practical recovery.
+
+Identify optional packages that the generic Hermes installer may have added but that this deployment does not use. Remove them only after confirming that Hermes and future updates do not require them.
+
+Before making a high-risk change to boot, partitioning, networking, or package management, explain the change and make sure a recovery path exists. Do not repartition or reformat the disk unless I explicitly ask you to in a later conversation.
+
+When the audit and necessary corrections are complete, summarize the final machine state and any remaining recommendations.
+EOF
+    chmod 600 "$MOUNTPOINT$FIRST_TASK_PATH"
+}
+
+write_firstboot_helper() {
+    cat > "$MOUNTPOINT/usr/local/sbin/hermes-firstboot" <<'FIRSTBOOT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+MARKER="/root/.hermes-firstboot-pending"
+FIRST_TASK="/root/HERMES_FIRST_TASK.md"
+MODEL="gpt-5.6-sol"
+PROVIDER="openai-codex"
+
+[[ -f "$MARKER" ]] || exit 0
+[[ $(id -u) -eq 0 ]] || { echo "Hermes first boot must run as root."; exit 1; }
+
+clear 2>/dev/null || true
+cat <<'EOF'
+============================================================
+                 HERMES FIRST-TIME SETUP
+============================================================
+
+Arch Linux is installed. Wi-Fi should reconnect automatically.
+Hermes will now authenticate to your ChatGPT/Codex subscription.
+
+No OpenAI API key will be requested or configured.
+EOF
+
+unset OPENAI_API_KEY || true
+if [[ -f /root/.hermes/.env ]]; then
+    sed -i '/^[[:space:]]*OPENAI_API_KEY=/d' /root/.hermes/.env
+    chmod 600 /root/.hermes/.env
+fi
+
+network_ok() {
+    ip route get 1.1.1.1 >/dev/null 2>&1 \
+        && curl -fsS --connect-timeout 5 --max-time 12 https://archlinux.org/ >/dev/null 2>&1
+}
+
+while ! network_ok; do
+    echo
+    echo "Wi-Fi/internet is not ready."
+    echo "1) Retry"
+    echo "2) Open iwctl"
+    echo "3) Open a shell"
+    echo "4) Exit and try again at the next root login"
+    read -r -p "Choose: " choice
+    case "$choice" in
+        2) iwctl || true ;;
+        3) bash || true ;;
+        4) exit 1 ;;
+        *) sleep 2 ;;
+    esac
+done
+
+echo
+printf '[OK] Internet connection is working.\n'
+
+# Apply Hermes' own current Blank Slate baseline using the functions shipped
+# with the installed Hermes version. This avoids duplicating a moving list of
+# toolset internals in this installer. We then pin the provider to Codex OAuth
+# and the initial model. If Hermes changes these internal helpers in a future
+# release, the fallback below runs the official setup wizard instead.
+HERMES_PY="/usr/local/lib/hermes-agent/venv/bin/python"
+if [[ -x "$HERMES_PY" ]] && "$HERMES_PY" - "$PROVIDER" "$MODEL" <<'PY'
+import sys
+provider, model_id = sys.argv[1], sys.argv[2]
+from hermes_cli.config import load_config, save_config
+from hermes_cli.setup import _blank_slate_minimal_toolsets, _blank_slate_minimize_config
+
+cfg = load_config()
+_blank_slate_minimal_toolsets(cfg)
+_blank_slate_minimize_config(cfg)
+model = cfg.setdefault("model", {})
+if not isinstance(model, dict):
+    model = {}
+    cfg["model"] = model
+model["provider"] = provider
+model["default"] = model_id
+terminal = cfg.setdefault("terminal", {})
+if isinstance(terminal, dict):
+    terminal["backend"] = "local"
+save_config(cfg)
+PY
+then
+    printf '[OK] Hermes Blank Slate configuration applied.\n'
+else
+    echo
+    echo "Hermes' internal Blank Slate helpers changed since this installer was built."
+    echo "The official setup wizard will run instead. Choose:"
+    echo "  - Blank Slate"
+    echo "  - ChatGPT or Codex Subscription"
+    echo "  - local terminal backend"
+    echo
+    hermes setup
+fi
+
+# Hermes' installer already wrote the opt-out marker with --no-skills, but keep
+# it explicit in case a future installer changes how config scaffolding works.
+mkdir -p /root/.hermes/skills
+touch /root/.hermes/.no-bundled-skills
+
+# Authenticate directly to the documented OpenAI Codex OAuth provider. The
+# user completes the device-code flow on a phone/second computer.
+echo
+if hermes auth list 2>/dev/null | grep -qi 'openai-codex'; then
+    printf '[OK] An OpenAI Codex OAuth credential is already present.\n'
+else
+    echo "Starting ChatGPT/Codex device-code authentication..."
+    echo "Use the URL and code Hermes displays on your phone or another computer."
+    echo
+    hermes auth add openai-codex
+fi

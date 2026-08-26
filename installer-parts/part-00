@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Hermes Minimal Arch Installer
+# ==============================================================================
+# Purpose:
+#   Destructively install a minimal, console-only Arch Linux system whose main
+#   application is Hermes Agent running as root and using the user's ChatGPT /
+#   Codex subscription through Hermes' OpenAI Codex OAuth provider.
+#
+# Intended environment:
+#   - Run as root from a CUSTOM Arch ISO built with archiso.
+#   - UEFI boot.
+#   - Wi-Fi only (normal WPA/WPA2/WPA3 personal network).
+#   - No desktop environment, no display manager, no local LLM.
+#   - The custom ISO should contain at least:
+#       arch-install-scripts bash coreutils curl dosfstools e2fsprogs gawk grep
+#       iwd iw iproute2 linux parted sed systemd util-linux
+#
+# Recommended location inside the ISO:
+#   /usr/local/bin/hermes-install
+#
+# Recommended autostart service settings:
+#   ExecStart=/usr/local/bin/hermes-install
+#   StandardInput=tty
+#   StandardOutput=tty
+#   StandardError=tty
+#   TTYPath=/dev/tty1
+#
+# Validated against Arch Linux / iwd / systemd-boot guidance and the current
+# NousResearch/hermes-agent installer on 2026-08-25.
+#
+# DANGER:
+#   This program ERASES the selected target disk. It deliberately requires an
+#   explicit disk selection and the exact word ERASE before destructive work.
+# ==============================================================================
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+INSTALLER_VERSION="2026.08.25-1"
+MOUNTPOINT="/mnt"
+STATE_REL="var/lib/hermes-installer"
+HOSTNAME_VALUE="hermes"
+TIMEZONE_VALUE="America/New_York"
+LOCALE_VALUE="en_US.UTF-8"
+KEYMAP_VALUE="us"
+EFI_SIZE_MIB=1024
+MIN_DISK_BYTES=$((16 * 1024 * 1024 * 1024))
+HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
+INTERNET_TEST_URL="https://archlinux.org/"
+FIRST_TASK_PATH="/root/HERMES_FIRST_TASK.md"
+
+CURRENT_STAGE="startup"
+TARGET_DISK=""
+ROOT_PART=""
+EFI_PART=""
+ROOT_PASSWORD=""
+LIVE_BOOT_DISK=""
+RESUME_MODE=0
+MICROCODE_PKG=""
+MICROCODE_INITRD=""
+
+if [[ -t 1 ]]; then
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_CYAN=$'\033[36m'
+    C_BOLD=$'\033[1m'
+    C_RESET=$'\033[0m'
+else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""
+fi
+
+say()     { printf '%s\n' "$*"; }
+info()    { printf '%s==>%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()      { printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail()    { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()     { fail "$*"; exit 1; }
+
+banner() {
+    clear 2>/dev/null || true
+    cat <<EOF
+${C_BOLD}============================================================
+              HERMES MINIMAL ARCH INSTALLER
+============================================================${C_RESET}
+
+This installer creates a console-only Arch Linux system for
+Hermes Agent. Hermes will run as root and will authenticate to
+ChatGPT/Codex by OAuth. No OpenAI API key will be configured.
+
+${C_RED}${C_BOLD}THE SELECTED INSTALLATION DISK WILL BE COMPLETELY ERASED.${C_RESET}
+
+Installer version: ${INSTALLER_VERSION}
+EOF
+}
+
+state_dir() {
+    printf '%s/%s' "$MOUNTPOINT" "$STATE_REL"
+}
+
+append_log() {
+    local message="$1"
+    local dir
+    dir="$(state_dir)"
+    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+        mkdir -p "$dir"
+        printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$dir/install.log" 2>/dev/null || true
+    fi
+}
+
+write_status() {
+    local last_completed="${1:-}"
+    local dir tmp
+    dir="$(state_dir)"
+    mountpoint -q "$MOUNTPOINT" 2>/dev/null || return 0
+    mkdir -p "$dir/completed"
+    tmp="$dir/status.tmp"
+    {
+        printf 'installer_version=%s\n' "$INSTALLER_VERSION"
+        printf 'target_disk=%s\n' "$TARGET_DISK"
+        printf 'root_part=%s\n' "$ROOT_PART"
+        printf 'efi_part=%s\n' "$EFI_PART"
+        printf 'last_completed=%s\n' "$last_completed"
+        printf 'updated_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp"
+    mv -f "$tmp" "$dir/status"
+}
+
+mark_stage() {
+    local stage="$1"
+    local dir
+    dir="$(state_dir)"
+    mkdir -p "$dir/completed"
+    date -u +'%Y-%m-%dT%H:%M:%SZ' > "$dir/completed/$stage"
+    write_status "$stage"
+    append_log "COMPLETED stage=$stage"
+}
+
+stage_done() {
+    [[ -f "$(state_dir)/completed/$1" ]]
+}
+
+on_error() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local command="${BASH_COMMAND:-unknown}"
+    trap - ERR
+    fail "Installation stopped during stage: $CURRENT_STAGE"
