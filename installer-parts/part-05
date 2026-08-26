@@ -148,4 +148,3 @@ else
     echo
     hermes auth add openai-codex
 fi
-
