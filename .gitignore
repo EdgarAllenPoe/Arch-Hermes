@@ -1,0 +1,5 @@
+.build/
+out/
+hermes-install.sh
+*.iso
+*.iso.sha256
