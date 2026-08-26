@@ -1,0 +1,150 @@
+                4) exit 0 ;;
+                *) warn "Choose 1, 2, 3, or 4." ;;
+            esac
+        fi
+    done
+}
+
+run_stage() {
+    local stage="$1" function_name="$2"
+    if stage_done "$stage"; then
+        ok "Stage already complete: $stage"
+        return 0
+    fi
+    CURRENT_STAGE="$stage"
+    append_log "BEGIN stage=$stage"
+    info "Stage: $stage"
+    "$function_name"
+    mark_stage "$stage"
+}
+
+install_base() {
+    local -a packages=(
+        base
+        linux
+        linux-firmware
+        iwd
+        curl
+        ca-certificates
+        git
+        base-devel
+    )
+    [[ -n "$MICROCODE_PKG" ]] && packages+=("$MICROCODE_PKG")
+
+    info "Installing the minimal Arch base and Hermes build/runtime prerequisites..."
+    pacstrap -K "$MOUNTPOINT" "${packages[@]}"
+}
+
+configure_system() {
+    info "Generating fstab..."
+    genfstab -U "$MOUNTPOINT" > "$MOUNTPOINT/etc/fstab"
+
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE_VALUE" "$MOUNTPOINT/etc/localtime"
+    arch-chroot "$MOUNTPOINT" hwclock --systohc
+
+    if grep -Eq '^#?[[:space:]]*en_US\.UTF-8[[:space:]]+UTF-8' "$MOUNTPOINT/etc/locale.gen"; then
+        sed -i -E 's/^#[[:space:]]*(en_US\.UTF-8[[:space:]]+UTF-8)/\1/' "$MOUNTPOINT/etc/locale.gen"
+    else
+        printf 'en_US.UTF-8 UTF-8\n' >> "$MOUNTPOINT/etc/locale.gen"
+    fi
+    arch-chroot "$MOUNTPOINT" locale-gen
+    printf 'LANG=%s\n' "$LOCALE_VALUE" > "$MOUNTPOINT/etc/locale.conf"
+    printf 'KEYMAP=%s\n' "$KEYMAP_VALUE" > "$MOUNTPOINT/etc/vconsole.conf"
+
+    printf '%s\n' "$HOSTNAME_VALUE" > "$MOUNTPOINT/etc/hostname"
+    cat > "$MOUNTPOINT/etc/hosts" <<EOF
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME_VALUE}.localdomain ${HOSTNAME_VALUE}
+EOF
+
+    chmod 700 "$MOUNTPOINT/root"
+    arch-chroot "$MOUNTPOINT" systemctl enable systemd-timesyncd.service >/dev/null
+}
+
+install_bootloader() {
+    local root_uuid
+    root_uuid="$(blkid -s UUID -o value "$ROOT_PART")"
+    [[ -n "$root_uuid" ]] || die "Could not determine root filesystem UUID."
+
+    info "Installing systemd-boot into the EFI System Partition..."
+    bootctl --esp-path="$MOUNTPOINT/boot" install
+
+    mkdir -p "$MOUNTPOINT/boot/loader/entries"
+    cat > "$MOUNTPOINT/boot/loader/loader.conf" <<'EOF'
+default arch.conf
+timeout 3
+console-mode keep
+editor no
+EOF
+
+    {
+        echo "title   Arch Linux - Hermes"
+        echo "linux   /vmlinuz-linux"
+        [[ -n "$MICROCODE_INITRD" ]] && echo "initrd  $MICROCODE_INITRD"
+        echo "initrd  /initramfs-linux.img"
+        echo "options root=UUID=$root_uuid rw"
+    } > "$MOUNTPOINT/boot/loader/entries/arch.conf"
+
+    {
+        echo "title   Arch Linux - Hermes (fallback initramfs)"
+        echo "linux   /vmlinuz-linux"
+        [[ -n "$MICROCODE_INITRD" ]] && echo "initrd  $MICROCODE_INITRD"
+        echo "initrd  /initramfs-linux-fallback.img"
+        echo "options root=UUID=$root_uuid rw"
+    } > "$MOUNTPOINT/boot/loader/entries/arch-fallback.conf"
+
+    [[ -f "$MOUNTPOINT/boot/vmlinuz-linux" ]] || die "Kernel was not found on the EFI partition."
+    [[ -f "$MOUNTPOINT/boot/initramfs-linux.img" ]] || die "Initramfs was not found on the EFI partition."
+    ok "systemd-boot configuration written."
+}
+
+persist_wifi() {
+    mkdir -p "$MOUNTPOINT/etc/iwd" "$MOUNTPOINT/var/lib/iwd"
+
+    # The live iwd connection profile contains the credentials needed to
+    # reconnect automatically after reboot. Preserve its restrictive modes.
+    if [[ -d /var/lib/iwd ]]; then
+        cp -a /var/lib/iwd/. "$MOUNTPOINT/var/lib/iwd/"
+    fi
+
+    cat > "$MOUNTPOINT/etc/iwd/main.conf" <<'EOF'
+[General]
+EnableNetworkConfiguration=true
+
+[Network]
+NameResolvingService=systemd
+EOF
+
+    arch-chroot "$MOUNTPOINT" systemctl enable iwd.service systemd-resolved.service >/dev/null
+
+    # During installation the target's systemd-resolved daemon is not running.
+    # Use the live ISO's working resolver temporarily so the Hermes installer
+    # inside arch-chroot can reach the internet. The first-boot stage converts
+    # this to systemd-resolved's normal symlink before reboot.
+    rm -f "$MOUNTPOINT/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$MOUNTPOINT/etc/resolv.conf"
+
+    ok "Wi-Fi profile and standalone iwd network configuration installed."
+}
+
+apply_root_password() {
+    capture_root_password
+    printf 'root:%s\n' "$ROOT_PASSWORD" | arch-chroot "$MOUNTPOINT" chpasswd
+    ROOT_PASSWORD=""
+    unset ROOT_PASSWORD
+    ok "Root password installed."
+}
+
+install_hermes() {
+    internet_ok || die "Internet connectivity was lost before the Hermes installation stage."
+
+    info "Downloading the current official Hermes Agent installer..."
+    curl -fsSL "$HERMES_INSTALL_URL" -o "$MOUNTPOINT/tmp/hermes-agent-install.sh"
+    chmod 700 "$MOUNTPOINT/tmp/hermes-agent-install.sh"
+
+    info "Installing Hermes as root (CLI only; no browser, computer-use driver, or bundled skills)..."
+    arch-chroot "$MOUNTPOINT" /bin/bash -lc \
+        '/tmp/hermes-agent-install.sh --skip-setup --skip-browser --skip-computer-use --no-skills'
+    rm -f "$MOUNTPOINT/tmp/hermes-agent-install.sh"
+
