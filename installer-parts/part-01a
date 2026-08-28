@@ -1,0 +1,72 @@
+    fail "Command failed at line $line (exit $rc): $command"
+    append_log "ERROR stage=$CURRENT_STAGE exit=$rc line=$line command=$command"
+    say
+    say "Nothing else will be erased automatically."
+    say "After correcting the problem, run:  hermes-install"
+    say "The installer will offer Resume when it finds a valid partial install."
+    exit "$rc"
+}
+trap on_error ERR
+
+require_root() {
+    [[ $(id -u) -eq 0 ]] || die "Run this installer as root."
+}
+
+require_uefi() {
+    [[ -d /sys/firmware/efi/efivars ]] || die "This installer requires the live USB to be booted in UEFI mode."
+}
+
+require_commands() {
+    local missing=()
+    local cmd
+    for cmd in \
+        arch-chroot awk blkid bootctl curl findmnt genfstab grep ip iwctl lsblk \
+        mkfs.ext4 mkfs.fat mount mountpoint pacstrap parted sed systemctl \
+        udevadm umount wipefs; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} )); then
+        fail "The custom Arch ISO is missing required commands:"
+        printf '  %s\n' "${missing[@]}" >&2
+        die "Add the corresponding packages to the archiso profile and rebuild the ISO."
+    fi
+}
+
+parent_disk_for_device() {
+    local dev="$1" disk="" type="" backing="" backing_src=""
+    [[ -n "$dev" ]] || return 1
+
+    # findmnt may append a filesystem-root suffix such as /dev/foo[/path].
+    dev="${dev%%\[*}"
+    dev="$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")"
+    [[ -b "$dev" ]] || return 1
+
+    type="$(lsblk -dnro TYPE "$dev" 2>/dev/null || true)"
+    disk="$(lsblk -srnpo NAME,TYPE "$dev" 2>/dev/null \
+        | awk '$2 == "disk" { print $1; exit }' || true)"
+    if [[ -n "$disk" ]]; then
+        printf '%s\n' "$disk"
+        return 0
+    fi
+    if [[ "$type" == "disk" ]]; then
+        printf '%s\n' "$dev"
+        return 0
+    fi
+
+    # Some multiboot tools expose the ISO through a loop device. Resolve the
+    # loop's backing file to the filesystem—and therefore disk—that contains it.
+    if [[ "$type" == "loop" ]] && command -v losetup >/dev/null 2>&1; then
+        backing="$(losetup -n -O BACK-FILE "$dev" 2>/dev/null | tail -n1 || true)"
+        if [[ -n "$backing" ]]; then
+            backing_src="$(findmnt -rn -o SOURCE -T "$backing" 2>/dev/null | head -n1 || true)"
+            if [[ -n "$backing_src" && "$backing_src" != "$dev" ]]; then
+                parent_disk_for_device "$backing_src"
+                return $?
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+detect_live_boot_disk() {
