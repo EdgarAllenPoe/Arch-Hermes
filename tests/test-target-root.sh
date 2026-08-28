@@ -4,8 +4,17 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# arch-chroot/pacstrap create temporary proc/sys/dev/run/tmp mounts. Keep those
+# mounts in a private namespace so test cleanup cannot alter the devtmpfs later
+# used by mkarchiso in the same CI container.
+if [[ "${ARCH_SSH_TARGET_TEST_NAMESPACED:-0}" != "1" ]]; then
+    command -v unshare >/dev/null 2>&1 || { echo "unshare is required." >&2; exit 1; }
+    exec unshare --mount --propagation private \
+        env ARCH_SSH_TARGET_TEST_NAMESPACED=1 "$0" "$@"
+fi
+
 [[ $(id -u) -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
-for cmd in arch-chroot pacstrap sshpass sshd; do
+for cmd in arch-chroot findmnt pacstrap sshpass sshd; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Missing command: $cmd" >&2; exit 1; }
 done
 
@@ -19,7 +28,20 @@ cleanup() {
     set +e
     [[ -n "$sshd_pid" ]] && kill "$sshd_pid" 2>/dev/null || true
     [[ -n "$sshd_pid" ]] && wait "$sshd_pid" 2>/dev/null || true
-    mountpoint -q "$target" 2>/dev/null && umount -R "$target" 2>/dev/null || true
+
+    # A chroot root does not have to be a mountpoint even when it contains
+    # nested mounts. Unmount deepest targets first instead of testing only the
+    # root path with mountpoint(1).
+    mapfile -t mounted_targets < <(
+        findmnt -R -n -o TARGET "$target" 2>/dev/null \
+            | awk '{ print length($0), $0 }' \
+            | sort -rn \
+            | cut -d' ' -f2-
+    )
+    local mounted
+    for mounted in "${mounted_targets[@]:-}"; do
+        [[ -n "$mounted" ]] && umount -l "$mounted" 2>/dev/null || true
+    done
     rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
