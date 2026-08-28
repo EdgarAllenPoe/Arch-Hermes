@@ -39,9 +39,9 @@ verify_installation() {
 
     local ssh_effective
     ssh_effective="$(arch-chroot "$MOUNTPOINT" sshd -T 2>/dev/null)"
-    grep -qx 'permitrootlogin yes' <<< "$ssh_effective" \
+    grep -iqx 'permitrootlogin yes' <<< "$ssh_effective" \
         || { fail "Effective SSH config does not permit root login"; failed=1; }
-    grep -qx 'passwordauthentication yes' <<< "$ssh_effective" \
+    grep -iqx 'passwordauthentication yes' <<< "$ssh_effective" \
         || { fail "Effective SSH config does not allow password authentication"; failed=1; }
 
     (( failed == 0 )) || die "Final verification found one or more problems."
