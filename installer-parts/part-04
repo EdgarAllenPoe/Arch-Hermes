@@ -1,42 +1,38 @@
-                4) exit 0 ;;
-                *) warn "Choose 1, 2, 3, or 4." ;;
-            esac
-        fi
-    done
-}
+    command -v partprobe >/dev/null 2>&1 && partprobe "$TARGET_DISK" || true
+    udevadm settle
 
-run_stage() {
-    local stage="$1" function_name="$2"
-    if stage_done "$stage"; then
-        ok "Stage already complete: $stage"
-        return 0
-    fi
-    CURRENT_STAGE="$stage"
-    append_log "BEGIN stage=$stage"
-    info "Stage: $stage"
-    "$function_name"
-    mark_stage "$stage"
+    [[ -b "$EFI_PART" ]] || die "EFI partition did not appear at $EFI_PART."
+    [[ -b "$ROOT_PART" ]] || die "Root partition did not appear at $ROOT_PART."
+
+    mkfs.fat -F 32 -n ARCH_SSH_EFI "$EFI_PART"
+    mkfs.ext4 -F -L ARCH_SSH_ROOT "$ROOT_PART"
+
+    mkdir -p "$MOUNTPOINT"
+    mount "$ROOT_PART" "$MOUNTPOINT"
+    mkdir -p "$MOUNTPOINT/boot"
+    mount "$EFI_PART" "$MOUNTPOINT/boot"
+    ok "Disk partitioning, formatting, and mounting completed."
 }
 
 install_base() {
+    CURRENT_STAGE="base-install"
     local -a packages=(
         base
         linux
         linux-firmware
-        iwd
+        networkmanager
+        openssh
         curl
         ca-certificates
-        git
-        base-devel
     )
     [[ -n "$MICROCODE_PKG" ]] && packages+=("$MICROCODE_PKG")
-
-    info "Installing the minimal Arch base and Hermes build/runtime prerequisites..."
+    info "Installing minimal Arch Linux, NetworkManager, and OpenSSH..."
     pacstrap -K "$MOUNTPOINT" "${packages[@]}"
 }
 
 configure_system() {
-    info "Generating fstab..."
+    CURRENT_STAGE="system-config"
+    info "Configuring the installed system..."
     genfstab -U "$MOUNTPOINT" > "$MOUNTPOINT/etc/fstab"
 
     ln -sf "/usr/share/zoneinfo/$TIMEZONE_VALUE" "$MOUNTPOINT/etc/localtime"
@@ -50,105 +46,68 @@ configure_system() {
     arch-chroot "$MOUNTPOINT" locale-gen
     printf 'LANG=%s\n' "$LOCALE_VALUE" > "$MOUNTPOINT/etc/locale.conf"
     printf 'KEYMAP=%s\n' "$KEYMAP_VALUE" > "$MOUNTPOINT/etc/vconsole.conf"
-
     printf '%s\n' "$HOSTNAME_VALUE" > "$MOUNTPOINT/etc/hostname"
-    cat > "$MOUNTPOINT/etc/hosts" <<EOF
+    cat > "$MOUNTPOINT/etc/hosts" <<EOF_HOSTS
 127.0.0.1 localhost
 ::1       localhost
 127.0.1.1 ${HOSTNAME_VALUE}.localdomain ${HOSTNAME_VALUE}
-EOF
+EOF_HOSTS
 
-    chmod 700 "$MOUNTPOINT/root"
+    printf 'root:%s\n' "$ROOT_PASSWORD" | arch-chroot "$MOUNTPOINT" chpasswd
+    ROOT_PASSWORD=""
+    unset ROOT_PASSWORD
+
     arch-chroot "$MOUNTPOINT" systemctl enable systemd-timesyncd.service >/dev/null
+    ok "Locale, clock, hostname, and root password configured."
 }
 
 install_bootloader() {
+    CURRENT_STAGE="bootloader"
     local root_uuid
     root_uuid="$(blkid -s UUID -o value "$ROOT_PART")"
     [[ -n "$root_uuid" ]] || die "Could not determine root filesystem UUID."
 
-    info "Installing systemd-boot into the EFI System Partition..."
     bootctl --esp-path="$MOUNTPOINT/boot" install
-
     mkdir -p "$MOUNTPOINT/boot/loader/entries"
-    cat > "$MOUNTPOINT/boot/loader/loader.conf" <<'EOF'
-default arch.conf
+    cat > "$MOUNTPOINT/boot/loader/loader.conf" <<'EOF_LOADER'
+default arch-ssh.conf
 timeout 3
 console-mode keep
 editor no
-EOF
+EOF_LOADER
 
     {
-        echo "title   Arch Linux - Hermes"
+        echo "title   Arch Linux - SSH Bootstrap"
         echo "linux   /vmlinuz-linux"
         [[ -n "$MICROCODE_INITRD" ]] && echo "initrd  $MICROCODE_INITRD"
         echo "initrd  /initramfs-linux.img"
         echo "options root=UUID=$root_uuid rw"
-    } > "$MOUNTPOINT/boot/loader/entries/arch.conf"
+    } > "$MOUNTPOINT/boot/loader/entries/arch-ssh.conf"
 
     {
-        echo "title   Arch Linux - Hermes (fallback initramfs)"
+        echo "title   Arch Linux - SSH Bootstrap (fallback initramfs)"
         echo "linux   /vmlinuz-linux"
         [[ -n "$MICROCODE_INITRD" ]] && echo "initrd  $MICROCODE_INITRD"
         echo "initrd  /initramfs-linux-fallback.img"
         echo "options root=UUID=$root_uuid rw"
-    } > "$MOUNTPOINT/boot/loader/entries/arch-fallback.conf"
+    } > "$MOUNTPOINT/boot/loader/entries/arch-ssh-fallback.conf"
 
-    [[ -f "$MOUNTPOINT/boot/vmlinuz-linux" ]] || die "Kernel was not found on the EFI partition."
-    [[ -f "$MOUNTPOINT/boot/initramfs-linux.img" ]] || die "Initramfs was not found on the EFI partition."
-    ok "systemd-boot configuration written."
+    [[ -f "$MOUNTPOINT/boot/vmlinuz-linux" ]] || die "Kernel missing from the EFI partition."
+    [[ -f "$MOUNTPOINT/boot/initramfs-linux.img" ]] || die "Initramfs missing from the EFI partition."
+    ok "systemd-boot installed and configured."
 }
 
-persist_wifi() {
-    mkdir -p "$MOUNTPOINT/etc/iwd" "$MOUNTPOINT/var/lib/iwd"
+install_network_and_ssh() {
+    CURRENT_STAGE="network-and-ssh"
+    info "Installing persistent Wi-Fi and SSH configuration..."
 
-    # The live iwd connection profile contains the credentials needed to
-    # reconnect automatically after reboot. Preserve its restrictive modes.
-    if [[ -d /var/lib/iwd ]]; then
-        cp -a /var/lib/iwd/. "$MOUNTPOINT/var/lib/iwd/"
-    fi
+    mkdir -p \
+        "$MOUNTPOINT/etc/NetworkManager/conf.d" \
+        "$MOUNTPOINT/etc/NetworkManager/system-connections" \
+        "$MOUNTPOINT/etc/ssh/sshd_config.d" \
+        "$MOUNTPOINT/usr/local/sbin" \
+        "$MOUNTPOINT/var/lib/arch-ssh-bootstrap"
 
-    cat > "$MOUNTPOINT/etc/iwd/main.conf" <<'EOF'
-[General]
-EnableNetworkConfiguration=true
-
-[Network]
-NameResolvingService=systemd
-EOF
-
-    arch-chroot "$MOUNTPOINT" systemctl enable iwd.service systemd-resolved.service >/dev/null
-
-    # During installation the target's systemd-resolved daemon is not running.
-    # Use the live ISO's working resolver temporarily so the Hermes installer
-    # inside arch-chroot can reach the internet. The first-boot stage converts
-    # this to systemd-resolved's normal symlink before reboot.
-    rm -f "$MOUNTPOINT/etc/resolv.conf"
-    cp -L /etc/resolv.conf "$MOUNTPOINT/etc/resolv.conf"
-
-    ok "Wi-Fi profile and standalone iwd network configuration installed."
-}
-
-apply_root_password() {
-    capture_root_password
-    printf 'root:%s\n' "$ROOT_PASSWORD" | arch-chroot "$MOUNTPOINT" chpasswd
-    ROOT_PASSWORD=""
-    unset ROOT_PASSWORD
-    ok "Root password installed."
-}
-
-install_hermes() {
-    local installer_rel="/root/hermes-agent-install.sh"
-
-    internet_ok || die "Internet connectivity was lost before the Hermes installation stage."
-
-    info "Downloading the current official Hermes Agent installer..."
-    # arch-chroot gives the target a private /tmp, so files staged under the
-    # target's /tmp are intentionally hidden. Stage this installer under /root.
-    curl -fsSL "$HERMES_INSTALL_URL" -o "$MOUNTPOINT$installer_rel"
-    chmod 700 "$MOUNTPOINT$installer_rel"
-
-    info "Installing Hermes as root (CLI only; no browser, computer-use driver, or bundled skills)..."
-    arch-chroot "$MOUNTPOINT" /bin/bash "$installer_rel" \
-        --skip-setup --skip-browser --skip-computer-use --no-skills
-    rm -f "$MOUNTPOINT$installer_rel"
-
+    install -m 644 "$TARGET_FILES/etc/NetworkManager/conf.d/10-arch-ssh-bootstrap.conf" \
+        "$MOUNTPOINT/etc/NetworkManager/conf.d/10-arch-ssh-bootstrap.conf"
+    install -m 600 "$WIFI_PROFILE_FILE" \
