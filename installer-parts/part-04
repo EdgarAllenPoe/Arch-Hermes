@@ -137,14 +137,18 @@ apply_root_password() {
 }
 
 install_hermes() {
+    local installer_rel="/root/hermes-agent-install.sh"
+
     internet_ok || die "Internet connectivity was lost before the Hermes installation stage."
 
     info "Downloading the current official Hermes Agent installer..."
-    curl -fsSL "$HERMES_INSTALL_URL" -o "$MOUNTPOINT/tmp/hermes-agent-install.sh"
-    chmod 700 "$MOUNTPOINT/tmp/hermes-agent-install.sh"
+    # arch-chroot gives the target a private /tmp, so files staged under the
+    # target's /tmp are intentionally hidden. Stage this installer under /root.
+    curl -fsSL "$HERMES_INSTALL_URL" -o "$MOUNTPOINT$installer_rel"
+    chmod 700 "$MOUNTPOINT$installer_rel"
 
     info "Installing Hermes as root (CLI only; no browser, computer-use driver, or bundled skills)..."
-    arch-chroot "$MOUNTPOINT" /bin/bash -lc \
-        '/tmp/hermes-agent-install.sh --skip-setup --skip-browser --skip-computer-use --no-skills'
-    rm -f "$MOUNTPOINT/tmp/hermes-agent-install.sh"
+    arch-chroot "$MOUNTPOINT" /bin/bash "$installer_rel" \
+        --skip-setup --skip-browser --skip-computer-use --no-skills
+    rm -f "$MOUNTPOINT$installer_rel"
 
