@@ -35,8 +35,32 @@ permissions:
   contents: read
 
 jobs:
+  target-ssh-login:
+    name: Prove real target root SSH login
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Prepare disposable-target test container
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git arch-install-scripts networkmanager openssh sshpass curl ca-certificates
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prove a disposable target accepts a real root SSH login
+        shell: bash
+        run: |
+          chmod +x target-files/usr/local/sbin/arch-ssh-firstboot tests/test-target-root.sh
+          ./tests/test-target-root.sh
+
   build-iso:
-    name: Test, build, boot, and verify ISO
+    name: Build, inspect, and UEFI-boot ISO
+    needs: target-ssh-login
     runs-on: ubuntu-latest
     timeout-minutes: 150
     container:
@@ -44,11 +68,10 @@ jobs:
       options: --privileged
 
     steps:
-      - name: Prepare Arch Linux build and test container
+      - name: Prepare clean Arch Linux ISO build container
         run: |
           pacman -Syu --noconfirm --needed \
-            git archiso libarchive squashfs-tools arch-install-scripts \
-            networkmanager openssh sshpass qemu-system-x86 edk2-ovmf
+            git archiso libarchive squashfs-tools qemu-system-x86 edk2-ovmf
 
       - name: Check out repository
         uses: actions/checkout@v4
@@ -65,10 +88,6 @@ jobs:
           ./tests/test-static.sh
           ./tests/test-firstboot-functions.sh
           ./build-iso.sh --prepare-only
-
-      - name: Prove a disposable target accepts a real root SSH login
-        shell: bash
-        run: ./tests/test-target-root.sh
 
       - name: Build and inspect custom ISO
         shell: bash
