@@ -1,0 +1,97 @@
+name: Build Arch Wi-Fi and SSH ISO
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-arch-ssh-iso.yml'
+      - 'assemble-installer.sh'
+      - 'installer-parts/**'
+      - 'installer.sha256'
+      - 'build-iso.sh'
+      - 'verify-iso.sh'
+      - 'overlay/**'
+      - 'target-files/**'
+      - 'tests/**'
+      - 'README.md'
+      - 'VERSION'
+  pull_request:
+    paths:
+      - '.github/workflows/build-arch-ssh-iso.yml'
+      - 'assemble-installer.sh'
+      - 'installer-parts/**'
+      - 'installer.sha256'
+      - 'build-iso.sh'
+      - 'verify-iso.sh'
+      - 'overlay/**'
+      - 'target-files/**'
+      - 'tests/**'
+      - 'README.md'
+      - 'VERSION'
+
+permissions:
+  contents: read
+
+jobs:
+  build-iso:
+    name: Test, build, boot, and verify ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Prepare Arch Linux build and test container
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git archiso libarchive squashfs-tools arch-install-scripts \
+            networkmanager openssh sshpass qemu-system-x86 edk2-ovmf
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate source and first-boot logic
+        shell: bash
+        run: |
+          chmod +x \
+            assemble-installer.sh build-iso.sh verify-iso.sh \
+            overlay/usr/local/sbin/arch-ssh-installer-launch \
+            target-files/usr/local/sbin/arch-ssh-firstboot \
+            tests/*.sh
+          ./assemble-installer.sh
+          ./tests/test-static.sh
+          ./tests/test-firstboot-functions.sh
+          ./build-iso.sh --prepare-only
+
+      - name: Prove a disposable target accepts a real root SSH login
+        shell: bash
+        run: ./tests/test-target-root.sh
+
+      - name: Build and inspect custom ISO
+        shell: bash
+        run: ./build-iso.sh
+
+      - name: UEFI boot smoke test
+        shell: bash
+        run: ./tests/test-iso-boot.sh "$(find out -maxdepth 1 -type f -name '*.iso' | head -n1)"
+
+      - name: Verify completed files and checksum
+        shell: bash
+        run: |
+          ls -lh out/
+          sha256sum -c out/*.iso.sha256
+
+      - name: Upload finished ISO
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-ssh-bootstrap-${{ github.run_number }}
+          path: |
+            out/*.iso
+            out/*.iso.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
