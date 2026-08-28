@@ -1,4 +1,4 @@
-name: Debug Hermes bootstrap exit 127
+name: Debug Hermes Codex OAuth on minimal Arch
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed arch-install-scripts curl ca-certificates
 
-      - name: Create the same minimal target root
+      - name: Create the same minimal target and install Hermes
         shell: bash
         run: |
           mkdir -p /target
@@ -29,19 +29,27 @@ jobs:
           rm -f /target/etc/resolv.conf
           cp -L /etc/resolv.conf /target/etc/resolv.conf
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-            -o /target/tmp/hermes-agent-install.sh
-          chmod 700 /target/tmp/hermes-agent-install.sh
-          ls -l /target/tmp/hermes-agent-install.sh
+            -o /target/root/hermes-agent-install.sh
+          chmod 700 /target/root/hermes-agent-install.sh
+          arch-chroot /target /bin/bash /root/hermes-agent-install.sh \
+            --skip-setup --skip-browser --skip-computer-use --no-skills
+          rm -f /target/root/hermes-agent-install.sh
+          arch-chroot /target hermes --version
 
-      - name: Run the exact arch-chroot Hermes command with tracing
+      - name: Exercise ChatGPT Codex device-code auth until prompt
         shell: bash
         run: |
           set +e
-          arch-chroot /target /bin/bash -lc \
-            'bash -x /tmp/hermes-agent-install.sh --skip-setup --skip-browser --skip-computer-use --no-skills' \
-            2>&1 | tee /tmp/hermes-bootstrap.log
+          timeout 25s arch-chroot /target /bin/bash -lc \
+            'unset OPENAI_API_KEY; hermes auth add openai-codex --no-browser' \
+            2>&1 | tee /tmp/codex-auth.log
           rc=${PIPESTATUS[0]}
-          echo "HERMES_INSTALL_EXIT=$rc"
-          echo "----- final 200 lines -----"
-          tail -n 200 /tmp/hermes-bootstrap.log
+          echo "CODEX_AUTH_EXIT=$rc"
+          echo "----- captured output -----"
+          cat /tmp/codex-auth.log
+          # timeout(124) is success for this diagnostic if the command reached
+          # an interactive device-code wait. A clean immediate failure is not.
+          if [[ $rc -eq 124 || $rc -eq 0 ]]; then
+            exit 0
+          fi
           exit "$rc"
