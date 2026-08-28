@@ -15,7 +15,7 @@ require_line() {
 
 require_line 'local installer_rel="/root/hermes-agent-install.sh"'
 require_line 'curl -fsSL "$HERMES_INSTALL_URL" -o "$MOUNTPOINT$installer_rel"'
-require_line 'arch-chroot "$MOUNTPOINT" /bin/bash "$installer_rel" \\'
+require_line 'arch-chroot "$MOUNTPOINT" /bin/bash "$installer_rel"'
 require_line 'rm -f "$MOUNTPOINT$installer_rel"'
 
 if grep -F -- '$MOUNTPOINT/tmp/hermes-agent-install.sh' "$installer" >/dev/null; then
