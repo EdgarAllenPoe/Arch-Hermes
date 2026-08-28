@@ -14,20 +14,17 @@ work="$(mktemp -d)"
 target="$work/root"
 port=$((22000 + RANDOM % 1000))
 sshd_pid=""
-mounted=0
 
 cleanup() {
     set +e
     [[ -n "$sshd_pid" ]] && kill "$sshd_pid" 2>/dev/null || true
     [[ -n "$sshd_pid" ]] && wait "$sshd_pid" 2>/dev/null || true
-    (( mounted )) && umount -R "$target" 2>/dev/null || true
-    rm -rf "$work"
+    mountpoint -q "$target" 2>/dev/null && umount -R "$target" 2>/dev/null || true
+    rm -rf "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 mkdir -p "$target"
-mount --bind "$target" "$target"
-mounted=1
 
 pacstrap -K "$target" base networkmanager openssh curl ca-certificates >/dev/null
 
@@ -49,8 +46,9 @@ ssh_effective="$(arch-chroot "$target" sshd -T)"
 grep -qx 'permitrootlogin yes' <<< "$ssh_effective"
 grep -qx 'passwordauthentication yes' <<< "$ssh_effective"
 
-arch-chroot "$target" /usr/bin/sshd -D -e -p "$port" -o ListenAddress=127.0.0.1 \
-    >"$work/sshd.log" 2>&1 &
+arch-chroot "$target" /bin/bash -c \
+    'install -d -m 0755 /run/sshd; exec /usr/bin/sshd -D -e -p "$1" -o ListenAddress=127.0.0.1' \
+    bash "$port" >"$work/sshd.log" 2>&1 &
 sshd_pid=$!
 
 for _ in {1..30}; do
