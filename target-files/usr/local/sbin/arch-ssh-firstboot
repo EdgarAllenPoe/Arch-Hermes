@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# First-boot end-to-end verification for NetworkManager Wi-Fi and root SSH.
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CONNECTION_NAME="arch-ssh-wifi"
+STATE_DIR="/var/lib/arch-ssh-bootstrap"
+VERIFIED_MARKER="$STATE_DIR/ssh-verified"
+LOG_FILE="$STATE_DIR/firstboot.log"
+
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_RED=$'\033[31m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_BLUE=$'\033[34m'
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok()   { printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*"; }
+log()  { printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$*" >> "$LOG_FILE"; }
+
+banner() {
+    clear 2>/dev/null || true
+    cat <<'EOF_BANNER'
+============================================================
+             ARCH LINUX WI-FI + SSH VERIFICATION
+============================================================
+
+This test checks the installed system after a real hard-drive boot.
+It will not report success until a remote root SSH login is accepted.
+EOF_BANNER
+    say
+}
+
+network_ready() {
+    systemctl is-active --quiet NetworkManager.service \
+        && ip route get 1.1.1.1 >/dev/null 2>&1 \
+        && getent ahostsv4 archlinux.org >/dev/null 2>&1 \
+        && curl -fsS --connect-timeout 5 --max-time 15 https://archlinux.org/ >/dev/null 2>&1
+}
+
+default_interface() {
+    ip route show default 2>/dev/null | awk 'NR == 1 {print $5}'
+}
+
+primary_ipv4() {
+    local iface
+    iface="$(default_interface)"
+    [[ -n "$iface" ]] || return 1
+    ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+        | awk 'NR == 1 {split($4, a, "/"); print a[1]}'
+}
+
+port_22_listening() {
+    ss -H -ltn 2>/dev/null | awk '$4 ~ /(^|\]|:)22$/ {found=1} END {exit !found}'
+}
+
+ssh_stack_ready() {
+    sshd -t >/dev/null 2>&1 \
+        && systemctl is-active --quiet sshd.service \
+        && port_22_listening
+}
+
+accepted_root_login() {
+    journalctl -b -u sshd.service --no-pager 2>/dev/null \
+        | grep -Eq 'Accepted (password|publickey|keyboard-interactive) for root from ' \
+        && return 0
+    who 2>/dev/null | awk '$1 == "root" && $2 ~ /^pts\// {found=1} END {exit !found}'
+}
+
+show_diagnostics() {
+    say
+    say "---------------- NetworkManager ----------------"
+    systemctl status NetworkManager.service --no-pager 2>&1 || true
+    say
+    nmcli general status 2>&1 || true
+    nmcli device status 2>&1 || true
+    say
+    nmcli connection show --active 2>&1 || true
+    say
+    say "---------------- IP and DNS ---------------------"
+    ip -4 addr 2>&1 || true
+    ip route 2>&1 || true
+    say
+    ls -l /etc/resolv.conf 2>&1 || true
+    cat /etc/resolv.conf 2>&1 || true
+    say
+    say "---------------- OpenSSH ------------------------"
+    sshd -t 2>&1 || true
+    systemctl status sshd.service --no-pager 2>&1 || true
+    ss -ltn 2>&1 || true
+    say
+    say "Recent NetworkManager log:"
+    journalctl -b -u NetworkManager.service -n 40 --no-pager 2>&1 || true
+    say
+    say "Recent SSH log:"
+    journalctl -b -u sshd.service -n 40 --no-pager 2>&1 || true
+    say
+}
+
+repair_and_wait_for_network() {
+    systemctl start NetworkManager.service
+    nmcli radio wifi on >/dev/null 2>&1 || true
+
+    if nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$CONNECTION_NAME"; then
+        nmcli --wait 30 connection up "$CONNECTION_NAME" >/dev/null 2>&1 || true
+    fi
+
+    local n
+    for n in {1..45}; do
+        if network_ready; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+network_recovery_menu() {
+    while ! repair_and_wait_for_network; do
+        say
+        fail "Wi-Fi or internet verification did not pass."
+        say "1) Retry the saved Wi-Fi connection"
+        say "2) Open NetworkManager's text interface (nmtui)"
+        say "3) Open a troubleshooting shell"
+        say "4) Show detailed diagnostics"
+        say "5) Reboot"
+        local choice
+        read -r -p "Choose: " choice
+        case "$choice" in
+            2) nmtui || true ;;
+            3) bash || true ;;
+            4) show_diagnostics ;;
+            5) reboot ;;
+            *) : ;;
+        esac
+    done
+}
+
+verify_ssh_service() {
+    info "Validating and starting OpenSSH..."
+    install -d -m 0755 /run/sshd
+    ssh-keygen -A >/dev/null
+    sshd -t
+    systemctl restart sshd.service
+
+    local n
+    for n in {1..20}; do
+        if ssh_stack_ready; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+show_success() {
+    local ip_address="$1" login_line=""
+    login_line="$(journalctl -b -u sshd.service --no-pager 2>/dev/null \
+        | grep -E 'Accepted (password|publickey|keyboard-interactive) for root from ' \
+        | tail -n1 || true)"
+
+    mkdir -p "$STATE_DIR"
+    {
+        printf 'verified_at=%s\n' "$(date -Is)"
+        printf 'ip_address=%s\n' "$ip_address"
+        printf 'login=%s\n' "$login_line"
+    } > "$VERIFIED_MARKER"
+    chmod 600 "$VERIFIED_MARKER"
+    log "SSH verified ip=$ip_address login=$login_line"
+
+    clear 2>/dev/null || true
+    cat <<EOF_SUCCESS
+============================================================
+                         SSH VERIFIED
+============================================================
+
+Wi-Fi:             WORKING
+Internet route:    WORKING
+DNS:               WORKING
+HTTPS:             WORKING
+SSH configuration: VALID
+SSH service:       RUNNING
+Port 22:           LISTENING
+Remote root login: CONFIRMED
+IP address:        $ip_address
+
+The minimal Arch Linux bootstrap is complete.
+Hermes has not been installed yet.
+
+Use the open SSH session on your other computer for all remaining work.
+After SSH keys are configured, disable root password authentication.
+============================================================
+EOF_SUCCESS
+    say
+}
+
+main() {
+    [[ $(id -u) -eq 0 ]] || { fail "Run as root."; exit 1; }
+    mkdir -p "$STATE_DIR"
+    touch "$LOG_FILE"
+    chmod 700 "$STATE_DIR"
+    chmod 600 "$LOG_FILE"
+
+    banner
+    info "Starting NetworkManager and activating the saved Wi-Fi profile..."
+    network_recovery_menu
+    ok "Wi-Fi, routing, DNS, and HTTPS are working."
+
+    if ! verify_ssh_service; then
+        show_diagnostics
+        fail "OpenSSH did not pass its startup checks."
+        exit 1
+    fi
+    ok "OpenSSH configuration is valid and port 22 is listening."
+
+    local ip_address fingerprint
+    ip_address="$(primary_ipv4)"
+    [[ -n "$ip_address" ]] || { show_diagnostics; fail "No global IPv4 address was found."; exit 1; }
+    fingerprint="$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null || true)"
+
+    say
+    say "From Windows, open PowerShell and run:"
+    say
+    printf '    ssh root@%s\n' "$ip_address"
+    say
+    say "Accept the host fingerprint when asked, then enter the root password."
+    [[ -n "$fingerprint" ]] && printf 'Server fingerprint: %s\n' "$fingerprint"
+    say
+    warn "Leave the new SSH session open until this screen reports SSH VERIFIED."
+    say
+    info "Waiting for an actual accepted remote root SSH login..."
+
+    while ! accepted_root_login; do
+        if ! network_ready; then
+            warn "Network connectivity dropped; attempting to restore it."
+            network_recovery_menu
+            ip_address="$(primary_ipv4)"
+            say "Current SSH command: ssh root@$ip_address"
+        fi
+        if ! ssh_stack_ready; then
+            warn "SSH stopped passing checks; restarting it."
+            verify_ssh_service || { show_diagnostics; sleep 5; }
+        fi
+        sleep 2
+    done
+
+    show_success "$ip_address"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
