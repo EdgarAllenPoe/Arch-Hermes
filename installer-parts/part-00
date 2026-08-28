@@ -1,150 +1,130 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Hermes Minimal Arch Installer
-# ==============================================================================
-# Purpose:
-#   Destructively install a minimal, console-only Arch Linux system whose main
-#   application is Hermes Agent running as root and using the user's ChatGPT /
-#   Codex subscription through Hermes' OpenAI Codex OAuth provider.
-#
-# Intended environment:
-#   - Run as root from a CUSTOM Arch ISO built with archiso.
-#   - UEFI boot.
-#   - Wi-Fi only (normal WPA/WPA2/WPA3 personal network).
-#   - No desktop environment, no display manager, no local LLM.
-#   - The custom ISO should contain at least:
-#       arch-install-scripts bash coreutils curl dosfstools e2fsprogs gawk grep
-#       iwd iw iproute2 linux parted sed systemd util-linux
-#
-# Recommended location inside the ISO:
-#   /usr/local/bin/hermes-install
-#
-# Recommended autostart service settings:
-#   ExecStart=/usr/local/bin/hermes-install
-#   StandardInput=tty
-#   StandardOutput=tty
-#   StandardError=tty
-#   TTYPath=/dev/tty1
-#
-# Validated against Arch Linux / iwd / systemd-boot guidance and the current
-# NousResearch/hermes-agent installer on 2026-08-25.
-#
-# DANGER:
-#   This program ERASES the selected target disk. It deliberately requires an
-#   explicit disk selection and the exact word ERASE before destructive work.
-# ==============================================================================
-
+# Minimal Arch Linux installer for a reliable Wi-Fi + root SSH bootstrap.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-INSTALLER_VERSION="2026.08.25-1"
+INSTALLER_VERSION="2026.08.28-ssh1"
 MOUNTPOINT="/mnt"
-STATE_REL="var/lib/hermes-installer"
-HOSTNAME_VALUE="hermes"
+TARGET_FILES="/usr/local/share/arch-ssh-bootstrap/target-files"
+CONNECTION_NAME="arch-ssh-wifi"
+HOSTNAME_VALUE="arch-hermes"
 TIMEZONE_VALUE="America/New_York"
 LOCALE_VALUE="en_US.UTF-8"
 KEYMAP_VALUE="us"
 EFI_SIZE_MIB=1024
 MIN_DISK_BYTES=$((16 * 1024 * 1024 * 1024))
-HERMES_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
-INTERNET_TEST_URL="https://archlinux.org/"
-FIRST_TASK_PATH="/root/HERMES_FIRST_TASK.md"
-
 CURRENT_STAGE="startup"
-TARGET_DISK=""
-ROOT_PART=""
-EFI_PART=""
-ROOT_PASSWORD=""
 LIVE_BOOT_DISK=""
-RESUME_MODE=0
+TARGET_DISK=""
+EFI_PART=""
+ROOT_PART=""
 MICROCODE_PKG=""
 MICROCODE_INITRD=""
+WIFI_IFACE=""
+WIFI_SSID=""
+WIFI_PROFILE_FILE=""
+LOG_FILE="/tmp/arch-ssh-install.log"
 
-if [[ -t 1 ]]; then
-    C_RED=$'\033[31m'
-    C_GREEN=$'\033[32m'
-    C_YELLOW=$'\033[33m'
-    C_CYAN=$'\033[36m'
-    C_BOLD=$'\033[1m'
-    C_RESET=$'\033[0m'
-else
-    C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_RESET=""
-fi
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_RED=$'\033[31m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_BLUE=$'\033[34m'
 
-say()     { printf '%s\n' "$*"; }
-info()    { printf '%s==>%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
-ok()      { printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-warn()    { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-fail()    { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-die()     { fail "$*"; exit 1; }
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok()   { printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+fail() { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { fail "$*"; exit 1; }
+append_log() { printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$*" >> "$LOG_FILE"; }
 
 banner() {
     clear 2>/dev/null || true
-    cat <<EOF
-${C_BOLD}============================================================
-              HERMES MINIMAL ARCH INSTALLER
-============================================================${C_RESET}
+    cat <<'EOF_BANNER'
+============================================================
+             ARCH LINUX WI-FI + SSH INSTALLER
+============================================================
 
-This installer creates a console-only Arch Linux system for
-Hermes Agent. Hermes will run as root and will authenticate to
-ChatGPT/Codex by OAuth. No OpenAI API key will be configured.
+This installer will erase one selected internal disk and install:
+  - minimal console-only Arch Linux
+  - NetworkManager with persistent Wi-Fi
+  - OpenSSH with temporary root password login
+  - a first-boot test that waits for a real remote SSH login
 
-${C_RED}${C_BOLD}THE SELECTED INSTALLATION DISK WILL BE COMPLETELY ERASED.${C_RESET}
-
-Installer version: ${INSTALLER_VERSION}
-EOF
-}
-
-state_dir() {
-    printf '%s/%s' "$MOUNTPOINT" "$STATE_REL"
-}
-
-append_log() {
-    local message="$1"
-    local dir
-    dir="$(state_dir)"
-    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
-        mkdir -p "$dir"
-        printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$message" >> "$dir/install.log" 2>/dev/null || true
-    fi
-}
-
-write_status() {
-    local last_completed="${1:-}"
-    local dir tmp
-    dir="$(state_dir)"
-    mountpoint -q "$MOUNTPOINT" 2>/dev/null || return 0
-    mkdir -p "$dir/completed"
-    tmp="$dir/status.tmp"
-    {
-        printf 'installer_version=%s\n' "$INSTALLER_VERSION"
-        printf 'target_disk=%s\n' "$TARGET_DISK"
-        printf 'root_part=%s\n' "$ROOT_PART"
-        printf 'efi_part=%s\n' "$EFI_PART"
-        printf 'last_completed=%s\n' "$last_completed"
-        printf 'updated_utc=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    } > "$tmp"
-    mv -f "$tmp" "$dir/status"
-}
-
-mark_stage() {
-    local stage="$1"
-    local dir
-    dir="$(state_dir)"
-    mkdir -p "$dir/completed"
-    date -u +'%Y-%m-%dT%H:%M:%SZ' > "$dir/completed/$stage"
-    write_status "$stage"
-    append_log "COMPLETED stage=$stage"
-}
-
-stage_done() {
-    [[ -f "$(state_dir)/completed/$1" ]]
+Hermes is intentionally NOT installed by this ISO.
+EOF_BANNER
+    say
+    warn "Nothing is erased until you select a disk and type ERASE exactly."
+    say
 }
 
 on_error() {
-    local rc=$?
-    local line="${BASH_LINENO[0]:-unknown}"
-    local command="${BASH_COMMAND:-unknown}"
-    trap - ERR
+    local rc=$? line="${1:-?}" command="${2:-unknown}"
+    set +e
+    say
     fail "Installation stopped during stage: $CURRENT_STAGE"
+    fail "Command failed at line $line (exit $rc): $command"
+    append_log "ERROR stage=$CURRENT_STAGE exit=$rc line=$line command=$command"
+    say
+    say "No additional disk changes will be made automatically."
+    say "Diagnostic log: $LOG_FILE"
+    say "Reboot from the USB to start a fresh installation after correcting the problem."
+    exit "$rc"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+
+require_root() {
+    [[ $(id -u) -eq 0 ]] || die "Run this installer as root."
+}
+
+require_uefi() {
+    [[ -d /sys/firmware/efi/efivars ]] || die "Boot the USB in UEFI mode."
+}
+
+require_files() {
+    [[ -d "$TARGET_FILES" ]] || die "The ISO is missing its target-files directory."
+    [[ -x "$TARGET_FILES/usr/local/sbin/arch-ssh-firstboot" ]] \
+        || die "The ISO is missing the first-boot verifier."
+}
+
+require_commands() {
+    local missing=() cmd
+    for cmd in \
+        arch-chroot awk blkid bootctl curl findmnt genfstab getent grep ip lsblk \
+        mkfs.ext4 mkfs.fat mount mountpoint nmcli nmtui pacstrap parted readlink \
+        reboot sed ssh-keygen sshd ss stat swapoff sync systemctl tail udevadm \
+        umount wipefs xargs; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if (( ${#missing[@]} )); then
+        fail "The custom ISO is missing required commands:"
+        printf '  %s\n' "${missing[@]}" >&2
+        die "Rebuild the ISO with the required packages."
+    fi
+}
+
+parent_disk_for_device() {
+    local dev="$1" disk="" type="" backing="" backing_src=""
+    [[ -n "$dev" ]] || return 1
+    dev="${dev%%\[*}"
+    dev="$(readlink -f "$dev" 2>/dev/null || printf '%s' "$dev")"
+    [[ -b "$dev" ]] || return 1
+
+    type="$(lsblk -dnro TYPE "$dev" 2>/dev/null || true)"
+    disk="$(lsblk -srnpo NAME,TYPE "$dev" 2>/dev/null \
+        | awk '$2 == "disk" { print $1; exit }' || true)"
+    if [[ -n "$disk" ]]; then
+        printf '%s\n' "$disk"
+        return 0
+    fi
+    if [[ "$type" == "disk" ]]; then
+        printf '%s\n' "$dev"
+        return 0
+    fi
+
+    if [[ "$type" == "loop" ]] && command -v losetup >/dev/null 2>&1; then
+        backing="$(losetup -n -O BACK-FILE "$dev" 2>/dev/null | tail -n1 || true)"
+        if [[ -n "$backing" ]]; then
