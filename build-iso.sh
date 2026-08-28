@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build a custom Arch Linux ISO that embeds and auto-starts hermes-install.
+# Build the custom Arch ISO that installs a minimal Wi-Fi + SSH system.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HERMES_ARCHISO_BUILD_DIR:-$SCRIPT_DIR/.build}"
+BUILD_DIR="${ARCH_SSH_BUILD_DIR:-$SCRIPT_DIR/.build}"
 PROFILE_DIR="$BUILD_DIR/profile"
 WORK_DIR="$BUILD_DIR/work"
-OUT_DIR="${HERMES_ARCHISO_OUT_DIR:-$SCRIPT_DIR/out}"
+OUT_DIR="${ARCH_SSH_OUT_DIR:-$SCRIPT_DIR/out}"
 RELENG_DIR="${ARCHISO_RELENG_DIR:-/usr/share/archiso/configs/releng}"
 PREPARE_ONLY=0
 CLEAN=0
@@ -16,20 +16,13 @@ usage() {
     cat <<USAGE
 Usage: $(basename "$0") [--prepare-only] [--clean] [--out DIR]
 
-Build the Hermes custom Arch installer ISO from Archiso's currently installed
-'releng' profile. This script is intended to run either on Arch Linux or in
-the Arch Linux container used by the included GitHub Actions workflow.
+Build the Arch Wi-Fi + SSH bootstrap ISO from Archiso's current releng profile.
 
 Options:
-  --prepare-only   Prepare and validate the custom profile but do not build ISO.
-  --clean          Remove the staged profile and work directory, then exit.
+  --prepare-only   Prepare and validate the custom profile without building.
+  --clean          Remove staged profile/work directories and exit.
   --out DIR        Put completed ISO files in DIR (default: ./out).
   -h, --help       Show this help.
-
-Environment overrides:
-  ARCHISO_RELENG_DIR          Alternate releng profile source.
-  HERMES_ARCHISO_BUILD_DIR    Alternate staging/work directory.
-  HERMES_ARCHISO_OUT_DIR      Alternate output directory.
 USAGE
 }
 
@@ -55,44 +48,37 @@ run_root() {
     elif command -v sudo >/dev/null 2>&1; then
         sudo "$@"
     else
-        die "This step needs root privileges and sudo is not installed."
+        die "This step needs root privileges and sudo is unavailable."
     fi
-}
-
-clean_stage() {
-    info "Removing staged profile/work directories..."
-    if [[ -e "$PROFILE_DIR" || -e "$WORK_DIR" ]]; then
-        run_root rm -rf -- "$PROFILE_DIR" "$WORK_DIR"
-    fi
-    mkdir -p "$BUILD_DIR"
-    say "Staging area cleaned. Existing ISO files in $OUT_DIR were preserved."
 }
 
 if (( CLEAN )); then
-    clean_stage
+    run_root rm -rf -- "$PROFILE_DIR" "$WORK_DIR"
+    say "Staging area cleaned. Existing ISO files in $OUT_DIR were preserved."
     exit 0
 fi
 
-[[ -f "$SCRIPT_DIR/hermes-install.sh" ]] || die "Missing $SCRIPT_DIR/hermes-install.sh"
-[[ -f "$SCRIPT_DIR/overlay/etc/systemd/system/hermes-installer.service" ]] || die "Missing installer systemd service."
-[[ -f "$SCRIPT_DIR/overlay/usr/local/sbin/hermes-installer-launch" ]] || die "Missing installer launcher."
+[[ -x "$SCRIPT_DIR/arch-ssh-install.sh" ]] || die "Missing executable arch-ssh-install.sh"
+[[ -f "$SCRIPT_DIR/overlay/etc/systemd/system/arch-ssh-installer.service" ]] || die "Missing installer service"
+[[ -x "$SCRIPT_DIR/overlay/usr/local/sbin/arch-ssh-installer-launch" ]] || die "Missing installer launcher"
+[[ -x "$SCRIPT_DIR/target-files/usr/local/sbin/arch-ssh-firstboot" ]] || die "Missing first-boot verifier"
 [[ -d "$RELENG_DIR" && -f "$RELENG_DIR/profiledef.sh" && -f "$RELENG_DIR/packages.x86_64" ]] \
-    || die "Archiso releng profile not found at: $RELENG_DIR"
+    || die "Archiso releng profile not found at $RELENG_DIR"
 
-bash -n "$SCRIPT_DIR/hermes-install.sh" || die "hermes-install.sh failed Bash syntax validation."
-bash -n "$SCRIPT_DIR/overlay/usr/local/sbin/hermes-installer-launch" || die "launcher failed Bash syntax validation."
+bash -n "$SCRIPT_DIR/arch-ssh-install.sh"
+bash -n "$SCRIPT_DIR/overlay/usr/local/sbin/arch-ssh-installer-launch"
+bash -n "$SCRIPT_DIR/target-files/usr/local/sbin/arch-ssh-firstboot"
 
 if (( ! PREPARE_ONLY )); then
-    [[ -f /etc/arch-release ]] || die "mkarchiso is supported on Arch Linux. Use the included GitHub Actions workflow if your computer is not running Arch."
-    command -v mkarchiso >/dev/null 2>&1 || die "mkarchiso is missing. Install the archiso package."
+    [[ -f /etc/arch-release ]] || die "mkarchiso must run on Arch Linux or the included GitHub Actions container."
+    command -v mkarchiso >/dev/null 2>&1 || die "Install the archiso package."
 fi
 
-info "Preparing a fresh profile from: $RELENG_DIR"
+info "Preparing profile from $RELENG_DIR"
 run_root rm -rf -- "$PROFILE_DIR" "$WORK_DIR"
 mkdir -p "$PROFILE_DIR" "$BUILD_DIR"
 cp -a "$RELENG_DIR/." "$PROFILE_DIR/"
 
-# Ensure every command the embedded installer requires exists in the live ISO.
 required_packages=(
     arch-install-scripts
     bash
@@ -101,89 +87,92 @@ required_packages=(
     curl
     dosfstools
     e2fsprogs
+    findutils
     gawk
     grep
     iproute2
-    iw
-    iwd
     linux
+    networkmanager
+    openssh
     parted
     sed
     systemd
     util-linux
+    wireless-regdb
+    wpa_supplicant
 )
-
 for pkg in "${required_packages[@]}"; do
     grep -Fxq "$pkg" "$PROFILE_DIR/packages.x86_64" || printf '%s\n' "$pkg" >> "$PROFILE_DIR/packages.x86_64"
 done
 
-info "Applying Hermes live-environment overlay..."
+info "Applying live-environment overlay"
 cp -a "$SCRIPT_DIR/overlay/." "$PROFILE_DIR/airootfs/"
-install -Dm755 "$SCRIPT_DIR/hermes-install.sh" "$PROFILE_DIR/airootfs/usr/local/bin/hermes-install"
+install -Dm755 "$SCRIPT_DIR/arch-ssh-install.sh" \
+    "$PROFILE_DIR/airootfs/usr/local/bin/arch-ssh-install"
+mkdir -p "$PROFILE_DIR/airootfs/usr/local/share/arch-ssh-bootstrap/target-files"
+cp -a "$SCRIPT_DIR/target-files/." \
+    "$PROFILE_DIR/airootfs/usr/local/share/arch-ssh-bootstrap/target-files/"
 
-# Own tty1 deterministically. tty2+ remain normal recovery consoles.
+# Use the same deterministic DNS policy in the live environment and target.
+install -Dm644 "$SCRIPT_DIR/target-files/etc/NetworkManager/conf.d/10-arch-ssh-bootstrap.conf" \
+    "$PROFILE_DIR/airootfs/etc/NetworkManager/conf.d/10-arch-ssh-bootstrap.conf"
+
+# Own tty1; tty2 and later remain ordinary recovery consoles.
 mkdir -p "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants"
 ln -sfn /dev/null "$PROFILE_DIR/airootfs/etc/systemd/system/getty@tty1.service"
-ln -sfn ../hermes-installer.service \
-    "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/hermes-installer.service"
+ln -sfn ../arch-ssh-installer.service \
+    "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/arch-ssh-installer.service"
 
-# This custom ISO is intended for direct local use only; do not expose the
-# releng profile's SSH service by default.
+# NetworkManager is the only network manager used by this ISO.
+ln -sfn /usr/lib/systemd/system/NetworkManager.service \
+    "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/NetworkManager.service"
 find "$PROFILE_DIR/airootfs/etc/systemd/system" -type l \
-    \( -name 'sshd.service' -o -name 'sshdgenkeys.service' \) -delete 2>/dev/null || true
+    \( -name 'iwd.service' -o -name 'systemd-networkd.service' \
+       -o -name 'systemd-networkd-wait-online.service' -o -name 'sshd.service' \
+       -o -name 'sshdgenkeys.service' \) -delete 2>/dev/null || true
 
 cat >> "$PROFILE_DIR/profiledef.sh" <<EOF_PROFILE
 
-# ---------------------------------------------------------------------------
-# Hermes custom ArchISO additions — generated by build-iso.sh
-# ---------------------------------------------------------------------------
-iso_name="hermes-arch"
-iso_label="HERMES_$(date -u +%Y%m%d)"
-iso_publisher="Hermes custom Arch installer"
-iso_application="Minimal Arch Linux bootstrap for Hermes Agent"
-file_permissions["/usr/local/bin/hermes-install"]="0:0:0755"
-file_permissions["/usr/local/sbin/hermes-installer-launch"]="0:0:0755"
+# Arch Wi-Fi + SSH bootstrap additions generated by build-iso.sh
+iso_name="arch-ssh-bootstrap"
+iso_label="ARCHSSH_$(date -u +%Y%m%d)"
+iso_publisher="Arch Wi-Fi and SSH bootstrap installer"
+iso_application="Minimal Arch Linux with NetworkManager and verified OpenSSH"
+file_permissions["/usr/local/bin/arch-ssh-install"]="0:0:0755"
+file_permissions["/usr/local/sbin/arch-ssh-installer-launch"]="0:0:0755"
+file_permissions["/usr/local/share/arch-ssh-bootstrap/target-files/usr/local/sbin/arch-ssh-firstboot"]="0:0:0755"
+file_permissions["/usr/local/share/arch-ssh-bootstrap/target-files/root/.bash_profile"]="0:0:0600"
 EOF_PROFILE
 
-[[ -x "$PROFILE_DIR/airootfs/usr/local/bin/hermes-install" ]] || die "Prepared installer is not executable."
-[[ -x "$PROFILE_DIR/airootfs/usr/local/sbin/hermes-installer-launch" ]] || die "Prepared launcher is not executable."
-[[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/getty@tty1.service" ]] || die "tty1 getty mask was not created."
-[[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/hermes-installer.service" ]] \
-    || die "Installer service was not enabled."
-
-grep -Fq 'file_permissions["/usr/local/bin/hermes-install"]="0:0:0755"' "$PROFILE_DIR/profiledef.sh" \
-    || die "profiledef permission override is missing."
+[[ -x "$PROFILE_DIR/airootfs/usr/local/bin/arch-ssh-install" ]] || die "Installer is not executable"
+[[ -x "$PROFILE_DIR/airootfs/usr/local/sbin/arch-ssh-installer-launch" ]] || die "Launcher is not executable"
+[[ -x "$PROFILE_DIR/airootfs/usr/local/share/arch-ssh-bootstrap/target-files/usr/local/sbin/arch-ssh-firstboot" ]] \
+    || die "First-boot verifier is not executable"
+[[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/getty@tty1.service" ]] || die "tty1 mask missing"
+[[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/arch-ssh-installer.service" ]] \
+    || die "Installer service is not enabled"
 
 info "Prepared profile: $PROFILE_DIR"
 if (( PREPARE_ONLY )); then
-    say "Profile preparation succeeded. No ISO was built (--prepare-only)."
+    say "Profile preparation succeeded. No ISO was built."
     exit 0
 fi
 
 mkdir -p "$OUT_DIR"
-info "Building ISO with mkarchiso..."
-info "Output directory: $OUT_DIR"
+info "Building ISO with mkarchiso"
 run_root mkarchiso -v -r -w "$WORK_DIR" -o "$OUT_DIR" "$PROFILE_DIR"
 
 iso_path="$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.iso' -printf '%T@ %p\n' \
     | sort -nr | head -n1 | cut -d' ' -f2-)"
-[[ -n "$iso_path" && -f "$iso_path" ]] || die "mkarchiso finished but no ISO was found in $OUT_DIR"
-
+[[ -n "$iso_path" && -f "$iso_path" ]] || die "mkarchiso finished without an ISO"
 sha256sum "$iso_path" > "$iso_path.sha256"
 
-info "Verifying embedded installer files inside the ISO..."
+info "Verifying embedded files in the completed ISO"
 "$SCRIPT_DIR/verify-iso.sh" "$iso_path"
 
 say
 say "============================================================"
-say "CUSTOM HERMES ARCH ISO READY"
+say "ARCH WI-FI + SSH ISO READY"
 say "============================================================"
 say "ISO:       $iso_path"
 say "SHA-256:   $iso_path.sha256"
-if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    say
-    say "GitHub Actions will upload the ISO and checksum as the workflow artifact."
-else
-    say
-    say "Write this ISO to a USB drive with a raw-image writer such as Rufus or Etcher."
-fi
