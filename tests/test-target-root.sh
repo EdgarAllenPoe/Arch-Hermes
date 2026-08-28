@@ -42,20 +42,11 @@ arch-chroot "$target" systemctl enable NetworkManager.service sshd.service >/dev
 mkdir -p /run/sshd "$target/run/sshd"
 arch-chroot "$target" sshd -t
 
-printf '%s\n' '----- /etc/ssh/sshd_config -----' >&2
-sed -n '1,220p' "$target/etc/ssh/sshd_config" >&2
-printf '%s\n' '----- /etc/ssh/sshd_config.d -----' >&2
-find "$target/etc/ssh/sshd_config.d" -maxdepth 1 -type f -print -exec sed -n '1,120p' {} \; >&2
-
-arch-chroot "$target" sshd -T -C user=root,host=localhost,addr=127.0.0.1 \
-    > "$work/sshd-effective.txt"
-printf '%s\n' '----- effective sshd configuration -----' >&2
-wc -c "$work/sshd-effective.txt" >&2
-sed -n '1,220p' "$work/sshd-effective.txt" >&2
-ssh_effective="$(cat "$work/sshd-effective.txt")"
-
-grep -qx 'permitrootlogin yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not permit root login." >&2; exit 1; }
-grep -qx 'passwordauthentication yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not allow password authentication." >&2; exit 1; }
+ssh_effective="$(arch-chroot "$target" sshd -T -C user=root,host=localhost,addr=127.0.0.1)"
+printf '%s\n' "$ssh_effective" \
+    | grep -iE '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|usepam) ' >&2 || true
+grep -iqx 'permitrootlogin yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not permit root login." >&2; exit 1; }
+grep -iqx 'passwordauthentication yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not allow password authentication." >&2; exit 1; }
 
 arch-chroot "$target" /bin/bash -c \
     'install -d -m 0755 /run/sshd; exec /usr/bin/sshd -D -e -p "$1" -o ListenAddress=127.0.0.1' \
