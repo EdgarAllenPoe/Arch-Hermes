@@ -1,5 +1,7 @@
 .build/
 out/
-hermes-install.sh
+*.log
 *.iso
 *.iso.sha256
+
+arch-ssh-install.sh

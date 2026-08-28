@@ -1,0 +1,21 @@
+[Unit]
+Description=Minimal Arch Linux Wi-Fi and SSH Installer
+Documentation=https://wiki.archlinux.org/title/Installation_guide
+Wants=NetworkManager.service
+After=systemd-user-sessions.service dbus.service NetworkManager.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/arch-ssh-installer-launch
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

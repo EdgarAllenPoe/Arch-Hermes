@@ -1,65 +1,97 @@
-# Arch-Hermes
+# Arch-Hermes: Minimal Arch Wi-Fi + SSH Bootstrap ISO
 
-Build a custom Arch Linux installer ISO for a dedicated, console-only Hermes Agent machine.
+This repository now builds a deliberately small **first-stage installer** for a dedicated Hermes computer.
 
-The ISO is built in GitHub Actions inside a privileged `archlinux:latest` container, so no local Arch Linux computer is required. The live ISO starts the Hermes installer automatically on `tty1`; recovery consoles remain available on other TTYs.
+The ISO does **not** install Hermes. Its only job is to establish a trustworthy remote-administration foundation:
 
-## Intended target
+1. Boot a custom ArchISO in UEFI mode.
+2. Connect to a normal password-protected Wi-Fi network through NetworkManager.
+3. Prove live routing, DNS, HTTPS, and connection-profile persistence.
+4. Erase one explicitly selected internal disk after the operator types `ERASE`.
+5. Install console-only Arch Linux, NetworkManager, and OpenSSH.
+6. Enable temporary root password SSH access.
+7. Reboot from the internal disk.
+8. Wait for a **real accepted remote root SSH login** before displaying `SSH VERIFIED`.
 
-- Entire target disk may be erased.
-- UEFI boot; Secure Boot disabled during installation.
-- Wi-Fi only, using `iwd`.
-- No desktop environment or display manager.
-- Hermes runs as `root`.
-- No local model.
-- Hermes authenticates to **ChatGPT/Codex Subscription** through device-code OAuth.
-- No `OPENAI_API_KEY` is configured.
+Hermes installation, ChatGPT/Codex OAuth, model selection, tools, and system customization happen later over the verified SSH connection.
 
-## Safety boundary
+## Installed system
 
-The ISO build is non-destructive. The installer running on the target laptop will not erase a disk until you:
+- UEFI with GPT
+- systemd-boot
+- ext4 root filesystem
+- no encryption
+- no swap
+- no graphical desktop
+- no normal user account
+- NetworkManager with an automatically reconnecting system Wi-Fi profile
+- NetworkManager-owned `/etc/resolv.conf` (`dns=default`, `rc-manager=file`)
+- OpenSSH enabled on port 22
+- temporary `PermitRootLogin yes` and `PasswordAuthentication yes`
+- first-console-login Wi-Fi/SSH verification program
 
-1. choose an eligible internal disk by number, and
-2. type the exact word `ERASE`.
+## Safety boundaries
 
-The live USB is detected and excluded from target choices, and removable disks are hidden by default.
+The installer never automatically chooses a target disk. It hides removable disks, excludes the detected installer disk, displays the selected disk and partitions, and requires the exact word:
 
-## Build the ISO
-
-Open **Actions → Build Hermes Arch ISO → Run workflow**, or merge/push a build-related change to `main`.
-
-The workflow:
-
-1. starts an Arch Linux build container;
-2. installs current Archiso tooling;
-3. reassembles `hermes-install.sh` from `installer-parts/` and verifies its SHA-256;
-4. copies Archiso's current `releng` profile;
-5. embeds the Hermes installer and its `tty1` systemd service;
-6. runs `mkarchiso`;
-7. opens the completed ISO and verifies the embedded installer/autostart files; and
-8. uploads the `.iso` and `.iso.sha256` as a workflow artifact on `main`/manual builds.
-
-## Why the installer is stored in parts
-
-The source installer is split into numbered text fragments under `installer-parts/` solely to make repository publication and review reliable. `assemble-installer.sh` concatenates them byte-for-byte into `hermes-install.sh` and refuses to proceed unless it matches `installer.sha256`.
-
-You can reconstruct it locally on Linux/macOS/WSL with:
-
-```bash
-./assemble-installer.sh
+```text
+ERASE
 ```
 
-## Important files
+There is no automatic resume or hidden repair path. A failed installation stops and requires a fresh USB boot before another destructive attempt.
 
-- `.github/workflows/build-hermes-archiso.yml` — GitHub Actions cloud build
-- `assemble-installer.sh` — reconstructs and verifies the installer
-- `installer-parts/` — exact source fragments of `hermes-install.sh`
-- `installer.sha256` — expected installer checksum
-- `build-iso.sh` — stages the custom Archiso profile and runs `mkarchiso`
-- `verify-iso.sh` — verifies the actual completed ISO contents
-- `overlay/` — live ISO systemd service and launcher
-- `verify-download.ps1` — Windows checksum verifier for the downloaded ISO
+## Build with GitHub Actions
 
-## After a successful build
+Open the repository's **Actions** tab and run **Build Arch Wi-Fi and SSH ISO**. A successful main-branch run uploads an artifact named:
 
-Download the `hermes-archiso-<run number>` artifact from the completed Actions run. It contains the ISO and its SHA-256 file. Verify the checksum, write the ISO to USB with Rufus/Etcher, boot the target laptop in UEFI mode, and follow the on-screen installer.
+```text
+arch-ssh-bootstrap-<run-number>
+```
+
+The artifact contains the ISO and its `.sha256` checksum.
+
+The workflow performs four layers of validation:
+
+1. Bash syntax and static safety invariants.
+2. Unit-style tests for network and accepted-login detection.
+3. A disposable Arch target-root integration test that starts the configured `sshd` and completes a real root password SSH login through it.
+4. Full ArchISO construction, embedded-file inspection, checksum verification, and a UEFI QEMU boot smoke test that proves the live installer service starts.
+
+The virtual tests cannot emulate the target laptop's physical Wi-Fi radio. The installer therefore performs the real Wi-Fi, DNS, HTTPS, profile-persistence, and post-reboot SSH tests on the target hardware before reporting success.
+
+## Write the USB
+
+Use Rufus or balenaEtcher to write the ISO as a disk image. Boot the target laptop in UEFI mode with Secure Boot disabled, then select:
+
+```text
+Arch Linux install medium (x86_64, UEFI)
+```
+
+The installer starts automatically on tty1. tty2 and later consoles remain available for recovery.
+
+## First hard-drive boot
+
+After installation:
+
+1. Remove the USB.
+2. Boot the internal drive.
+3. Log in locally as `root`.
+4. The first-boot verifier starts on tty1.
+5. It restores the saved NetworkManager connection, checks routing/DNS/HTTPS, validates and starts `sshd`, and displays the laptop's IP address.
+6. From Windows, run the displayed command, for example:
+
+```powershell
+ssh root@192.168.1.42
+```
+
+7. Leave the SSH session open until the laptop displays:
+
+```text
+SSH VERIFIED
+```
+
+Only then should Hermes installation begin.
+
+## Security after bootstrap
+
+Root password SSH is intentionally temporary. After key-based SSH access is tested, replace it with public-key authentication and disable both root password login and password authentication.

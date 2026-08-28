@@ -1,0 +1,122 @@
+            backing_src="$(findmnt -rn -o SOURCE -T "$backing" 2>/dev/null | head -n1 || true)"
+            if [[ -n "$backing_src" && "$backing_src" != "$dev" ]]; then
+                parent_disk_for_device "$backing_src"
+                return $?
+            fi
+        fi
+    fi
+    return 1
+}
+
+detect_live_boot_disk() {
+    local src="" uuid="" token="" disk=""
+    local -a cmdline_tokens=()
+    LIVE_BOOT_DISK=""
+
+    src="$(findmnt -rn -o SOURCE /run/archiso/bootmnt 2>/dev/null | head -n1 || true)"
+    disk="$(parent_disk_for_device "$src" || true)"
+
+    if [[ -z "$disk" ]]; then
+        src=""
+        IFS=' ' read -r -a cmdline_tokens < /proc/cmdline || true
+        for token in "${cmdline_tokens[@]}"; do
+            case "$token" in
+                archisosearchuuid=*) uuid="${token#archisosearchuuid=}" ;;
+                archisodevice=*) src="${token#archisodevice=}" ;;
+            esac
+        done
+
+        if [[ -n "$src" ]]; then
+            case "$src" in
+                UUID=*) src="$(blkid -U "${src#UUID=}" 2>/dev/null || true)" ;;
+                LABEL=*) src="$(blkid -L "${src#LABEL=}" 2>/dev/null || true)" ;;
+                PARTUUID=*) src="$(blkid -t "PARTUUID=${src#PARTUUID=}" -o device 2>/dev/null | head -n1 || true)" ;;
+                PARTLABEL=*) src="$(blkid -t "PARTLABEL=${src#PARTLABEL=}" -o device 2>/dev/null | head -n1 || true)" ;;
+                *) src="$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")" ;;
+            esac
+        elif [[ -n "$uuid" ]]; then
+            src="$(blkid -U "$uuid" 2>/dev/null || true)"
+        fi
+        disk="$(parent_disk_for_device "$src" || true)"
+    fi
+
+    if [[ -n "$disk" ]]; then
+        LIVE_BOOT_DISK="$disk"
+        info "Installer media detected on $LIVE_BOOT_DISK; it will not be offered as a target."
+    else
+        warn "Could not identify the physical installer disk. Removable disks remain hidden."
+    fi
+    return 0
+}
+
+detect_microcode() {
+    local vendor
+    vendor="$(grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}' || true)"
+    case "$vendor" in
+        GenuineIntel)
+            MICROCODE_PKG="intel-ucode"
+            MICROCODE_INITRD="/intel-ucode.img"
+            ;;
+        AuthenticAMD)
+            MICROCODE_PKG="amd-ucode"
+            MICROCODE_INITRD="/amd-ucode.img"
+            ;;
+        *)
+            MICROCODE_PKG=""
+            MICROCODE_INITRD=""
+            ;;
+    esac
+}
+
+prepare_live_networkmanager() {
+    CURRENT_STAGE="live-network-manager"
+    info "Switching the live USB to NetworkManager..."
+
+    systemctl stop iwd.service systemd-networkd.service systemd-networkd-wait-online.service \
+        systemd-resolved.service 2>/dev/null || true
+    rm -f /etc/resolv.conf
+    : > /etc/resolv.conf
+    chmod 644 /etc/resolv.conf
+    systemctl restart NetworkManager.service
+
+    local n
+    for n in {1..20}; do
+        systemctl is-active --quiet NetworkManager.service && break
+        sleep 1
+    done
+    systemctl is-active --quiet NetworkManager.service \
+        || die "NetworkManager did not start in the live environment."
+
+    nmcli radio wifi on
+    ok "NetworkManager is running."
+}
+
+network_ready() {
+    ip route get 1.1.1.1 >/dev/null 2>&1 \
+        && getent ahostsv4 archlinux.org >/dev/null 2>&1 \
+        && curl -fsS --connect-timeout 5 --max-time 15 https://archlinux.org/ >/dev/null 2>&1
+}
+
+find_wifi_interface() {
+    nmcli -t -f DEVICE,TYPE device status 2>/dev/null \
+        | awk -F: '$2 == "wifi" { print $1; exit }'
+}
+
+scan_ssids() {
+    local iface="$1"
+    nmcli device wifi rescan ifname "$iface" >/dev/null 2>&1 || true
+    sleep 2
+    nmcli -t --escape yes -f SSID device wifi list ifname "$iface" 2>/dev/null \
+        | sed -e 's/\\:/:/g' -e '/^[[:space:]]*$/d' \
+        | awk '!seen[$0]++'
+}
+
+locate_live_profile() {
+    local uuid file
+    uuid="$(nmcli -g connection.uuid connection show "$CONNECTION_NAME")"
+    file="/etc/NetworkManager/system-connections/${CONNECTION_NAME}.nmconnection"
+    if [[ -f "$file" ]]; then
+        printf '%s\n' "$file"
+        return 0
+    fi
+    file="$(grep -rlF "uuid=$uuid" /etc/NetworkManager/system-connections 2>/dev/null | head -n1 || true)"

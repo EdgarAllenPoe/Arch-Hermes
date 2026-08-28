@@ -1,10 +1,12 @@
-# Build references
+# Primary technical sources
 
-Verified 2026-08-25.
+- Arch Linux Installation Guide: https://wiki.archlinux.org/title/Installation_guide
+- Archiso: https://wiki.archlinux.org/title/Archiso
+- Archiso source and releng profile: https://github.com/archlinux/archiso
+- NetworkManager: https://wiki.archlinux.org/title/NetworkManager
+- NetworkManager configuration reference: https://networkmanager.dev/docs/api/latest/NetworkManager.conf.html
+- nmcli reference: https://networkmanager.dev/docs/api/latest/nmcli.html
+- OpenSSH: https://wiki.archlinux.org/title/OpenSSH
+- Arch Linux package metadata: https://archlinux.org/packages/
 
-- Archiso project: https://github.com/archlinux/archiso
-- ArchWiki Archiso: https://wiki.archlinux.org/title/Archiso
-- GitHub Docs — adding/uploading files: https://docs.github.com/en/repositories/working-with-files/managing-files/adding-a-file-to-a-repository
-- GitHub Actions artifact upload action: https://github.com/actions/upload-artifact
-
-The official Archiso project states that image creation is supported on Arch Linux and that the `releng` profile is the basis for the monthly Arch installation medium. The included GitHub Actions workflow therefore runs the build in an Arch Linux container rather than attempting to run `mkarchiso` directly on Windows or another host OS.
+The ISO uses the releng profile installed by the current Arch `archiso` package at build time rather than carrying a frozen copy.
