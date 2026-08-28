@@ -42,9 +42,10 @@ arch-chroot "$target" systemctl enable NetworkManager.service sshd.service >/dev
 mkdir -p /run/sshd "$target/run/sshd"
 arch-chroot "$target" sshd -t
 
-ssh_effective="$(arch-chroot "$target" sshd -T)"
-grep -qx 'permitrootlogin yes' <<< "$ssh_effective"
-grep -qx 'passwordauthentication yes' <<< "$ssh_effective"
+ssh_effective="$(arch-chroot "$target" sshd -T -C user=root,host=localhost,addr=127.0.0.1)"
+printf '%s\n' "$ssh_effective" | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|usepam) ' >&2 || true
+grep -qx 'permitrootlogin yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not permit root login." >&2; exit 1; }
+grep -qx 'passwordauthentication yes' <<< "$ssh_effective" || { echo "Effective sshd policy does not allow password authentication." >&2; exit 1; }
 
 arch-chroot "$target" /bin/bash -c \
     'install -d -m 0755 /run/sshd; exec /usr/bin/sshd -D -e -p "$1" -o ListenAddress=127.0.0.1' \
