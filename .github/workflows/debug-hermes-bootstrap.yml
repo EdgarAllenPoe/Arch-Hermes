@@ -1,0 +1,36 @@
+name: Debug Hermes bootstrap exit 127
+
+on:
+  push:
+    branches:
+      - debug/hermes-bootstrap-127
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install the same target prerequisites
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base linux linux-firmware iwd curl ca-certificates git base-devel
+
+      - name: Run the official Hermes installer with tracing
+        shell: bash
+        run: |
+          set +e
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o /tmp/hermes-agent-install.sh
+          chmod 700 /tmp/hermes-agent-install.sh
+          bash -x /tmp/hermes-agent-install.sh \
+            --skip-setup --skip-browser --skip-computer-use --no-skills \
+            2>&1 | tee /tmp/hermes-bootstrap.log
+          rc=${PIPESTATUS[0]}
+          echo "HERMES_INSTALL_EXIT=$rc"
+          echo "----- final 150 lines -----"
+          tail -n 150 /tmp/hermes-bootstrap.log
+          exit "$rc"
