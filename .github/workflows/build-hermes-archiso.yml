@@ -46,9 +46,10 @@ jobs:
 
       - name: Assemble and validate installer
         run: |
-          chmod +x assemble-installer.sh build-iso.sh verify-iso.sh overlay/usr/local/sbin/hermes-installer-launch tests/test-installer-startup.sh
+          chmod +x assemble-installer.sh build-iso.sh verify-iso.sh overlay/usr/local/sbin/hermes-installer-launch tests/test-installer-startup.sh tests/test-hermes-bootstrap-staging.sh
           ./assemble-installer.sh
           ./tests/test-installer-startup.sh hermes-install.sh
+          ./tests/test-hermes-bootstrap-staging.sh hermes-install.sh
           bash -n build-iso.sh
           bash -n verify-iso.sh
           bash -n overlay/usr/local/sbin/hermes-installer-launch
