@@ -1,0 +1,121 @@
+name: Temporary Parallel PyKokoro Panic of 1893 Narration
+
+on:
+  push:
+    branches:
+      - temporary/pykokoro-panic-1893-20260904
+    paths:
+      - ".github/workflows/pykokoro-panic-1893-parallel.yml"
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  PART_COUNT: "8"
+
+jobs:
+  render:
+    name: Render part ${{ matrix.part }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      PART_INDEX: ${{ matrix.part }}
+      OUTPUT_DIR: ${{ github.workspace }}/output
+
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyKokoro and audio dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends espeak-ng libsndfile1
+          python -m pip install --upgrade pip
+          python -m pip install "pykokoro[cpu]==0.8.8"
+          python - <<'PY'
+          import importlib.util
+          import subprocess
+          import sys
+
+          if importlib.util.find_spec("spacy") is not None:
+              import spacy
+              try:
+                  spacy.load("en_core_web_sm")
+              except OSError:
+                  subprocess.run(
+                      [sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
+                      check=True,
+                  )
+          PY
+
+      - name: Render assigned report section
+        run: python .github/pykokoro-panic-1893/render_part.py
+
+      - name: Upload lossless section
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}
+          path: |
+            output/part-${{ matrix.part }}.wav
+            output/part-${{ matrix.part }}.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  merge:
+    name: Merge, master, and validate narration
+    needs: render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PARTS_ROOT: ${{ github.workspace }}/parts
+      OUTPUT_DIR: ${{ github.workspace }}/output
+
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install merge and validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg libsndfile1
+          python -m pip install --upgrade pip
+          python -m pip install numpy soundfile
+
+      - name: Download all lossless sections
+        uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: ${{ env.PARTS_ROOT }}
+          merge-multiple: false
+
+      - name: Merge, normalize, encode, and validate
+        run: python .github/pykokoro-panic-1893/merge_parts.py
+
+      - name: Upload finished PyKokoro narration
+        uses: actions/upload-artifact@v4
+        with:
+          name: panic-of-1893-pykokoro-parallel
+          path: |
+            output/Panic_of_1893_PyKokoro_Male_US.mp3
+            output/PyKokoro_validation.json
+            output/ffprobe.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
