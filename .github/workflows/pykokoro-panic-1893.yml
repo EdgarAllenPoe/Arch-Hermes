@@ -1,0 +1,67 @@
+name: Temporary PyKokoro Panic of 1893 Narration
+
+on:
+  push:
+    branches:
+      - temporary/pykokoro-panic-1893-20260904
+    paths:
+      - ".github/workflows/pykokoro-panic-1893.yml"
+      - "temporary/pykokoro-panic-1893/**"
+
+permissions:
+  contents: read
+
+jobs:
+  narrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      OUTPUT_DIR: ${{ github.workspace }}/output
+
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyKokoro and audio tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends espeak-ng ffmpeg libsndfile1
+          python -m pip install --upgrade pip
+          python -m pip install "pykokoro[cpu]==0.8.8"
+          python - <<'PY'
+          import importlib.util
+          import subprocess
+          import sys
+
+          if importlib.util.find_spec("spacy") is not None:
+              import spacy
+              try:
+                  spacy.load("en_core_web_sm")
+              except OSError:
+                  subprocess.run(
+                      [sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
+                      check=True,
+                  )
+          PY
+
+      - name: Render and validate full narration
+        run: python temporary/pykokoro-panic-1893/render.py
+
+      - name: Upload finished MP3 and validation records
+        uses: actions/upload-artifact@v4
+        with:
+          name: panic-of-1893-pykokoro
+          path: |
+            output/Panic_of_1893_PyKokoro_Male_US.mp3
+            output/PyKokoro_validation.json
+            output/ffprobe.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
