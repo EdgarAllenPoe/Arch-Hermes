@@ -1,0 +1,102 @@
+name: Hermes Voice Button Build
+
+on:
+  push:
+    branches:
+      - hvb-build-20260912
+    paths:
+      - 'hvb-build/TRIGGER'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated build branch
+        uses: actions/checkout@v4
+
+      - name: Unpack project source
+        run: |
+          mkdir -p "$RUNNER_TEMP/hvb"
+          cat hvb-build/source.part.* | base64 -d > "$RUNNER_TEMP/hvb/source.tar.gz"
+          tar -xzf "$RUNNER_TEMP/hvb/source.tar.gz" -C "$RUNNER_TEMP/hvb"
+          echo "HVB=$RUNNER_TEMP/hvb/Hermes-Voice-Button-v1.0" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.6
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '9.6'
+
+      - name: Install Android 17 / API 37 platform
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-37"
+
+      - name: Build signed installable Android APK
+        working-directory: ${{ env.HVB }}/android
+        run: |
+          gradle --no-daemon :app:assembleDebug --stacktrace
+          test -f app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p "$RUNNER_TEMP/out/android"
+          cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/out/android/HermesVoice-Pixel9Pro-Android17.apk"
+          sha256sum "$RUNNER_TEMP/out/android/HermesVoice-Pixel9Pro-Android17.apk" > "$RUNNER_TEMP/out/android/SHA256SUMS.txt"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install current PlatformIO
+        run: python -m pip install --upgrade platformio
+
+      - name: Build XIAO nRF54LM20A Sense firmware
+        working-directory: ${{ env.HVB }}/firmware
+        run: |
+          pio run -e seeed-xiao-nrf54lm20a
+          DTS=$(find .pio/build/seeed-xiao-nrf54lm20a -name zephyr.dts -print -quit)
+          test -n "$DTS"
+          python "$HVB/tools/check_firmware_dts.py" "$DTS"
+          mkdir -p "$RUNNER_TEMP/out/firmware"
+          find .pio/build/seeed-xiao-nrf54lm20a -maxdepth 3 -type f \
+            \( -name '*.hex' -o -name '*.bin' -o -name '*.elf' -o -name '*.uf2' -o -name 'zephyr.dts' -o -name '*.map' \) \
+            -exec cp -v {} "$RUNNER_TEMP/out/firmware/" \;
+          test -n "$(find "$RUNNER_TEMP/out/firmware" -type f \( -name '*.hex' -o -name '*.bin' \) -print -quit)"
+          (cd "$RUNNER_TEMP/out/firmware" && sha256sum * > SHA256SUMS.txt)
+
+      - name: Package offline sources, receiver, and setup files
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/project"
+          cp -a "$HVB" "$RUNNER_TEMP/out/project/Hermes-Voice-Button-v1.0"
+          cat > "$RUNNER_TEMP/out/README-FIRST.txt" <<'EOF'
+          Hermes Voice Button v1.0 build artifacts
+          Target phone: Pixel 9 Pro / Android 17 (API 37)
+          Recorder: XIAO nRF54LM20A Sense
+          Hermes endpoint: http://100.99.200.55:8765/v1/voice
+          BLE pairing passkey: 194504
+
+          1. Install the APK from android/ on the Pixel 9 Pro.
+          2. Flash a firmware .hex/.bin using the Seeed PlatformIO/Zephyr flashing method documented in the project.
+          3. On the Hermes computer, install receiver/ as the regular Hermes user.
+          4. The receiver install script generates a private server bearer token locally.
+          5. Copy that token into the Android app once during setup, pair the recorder, then Start relay.
+          EOF
+          (cd "$RUNNER_TEMP/out" && find . -type f -print0 | sort -z | xargs -0 sha256sum > ALL-SHA256SUMS.txt)
+
+      - name: Upload complete build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hermes-Voice-Button-v1.0-Pixel9Pro-Android17
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
